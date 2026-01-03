@@ -1,6 +1,6 @@
-﻿// ------------------------------------------------------------
+// ------------------------------------------------------------
 // MyAssetManager.cpp
-// v1.1
+// v1.2 
 // ------------------------------------------------------------
 
 #define NOMINMAX
@@ -12,7 +12,6 @@
 #include <shlobj.h>
 #include <vector>
 #include <string>
-#include <fstream>
 #include <algorithm>
 #include <sstream>
 #include <set>
@@ -28,6 +27,13 @@
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
+
+// 関数名を強制エクスポート
+#if defined(_M_IX86)
+  #pragma comment(linker, "/EXPORT:RegisterPlugin=_RegisterPlugin")
+#elif defined(_M_AMD64)
+  #pragma comment(linker, "/EXPORT:RegisterPlugin")
+#endif
 
 using namespace Gdiplus;
 
@@ -46,6 +52,8 @@ using namespace Gdiplus;
 #define IDM_EDIT          301
 #define IDM_DELETE        302
 #define IDM_SETTINGS      303
+#define IDM_TOGGLE_FIXED  304 
+
 #define IDC_EDIT_NAME     101
 #define IDC_COMBO_CAT     102
 #define ID_BTN_SAVE       103
@@ -79,11 +87,14 @@ static constexpr COLORREF COL_BTN_BG    = RGB(60, 60, 60);
 static constexpr COLORREF COL_BTN_PUSH  = RGB(100, 100, 100);
 static constexpr COLORREF COL_BTN_ACT   = RGB(100, 120, 200);
 static constexpr COLORREF COL_INPUT_BG  = RGB(20, 20, 20);
+static constexpr COLORREF COL_FIXED_MARK = RGB(31, 205, 219);
 
 // --- 構造体 ---
 struct Asset {
     std::wstring name; std::wstring path; std::wstring imagePath; std::wstring category;
-    bool isFavorite; Image* pImage; UINT frameCount; UINT* frameDelays; int currentFrame; PropertyItem* pPropertyItem;
+    bool isFavorite; 
+    bool isFixedFrame; 
+    Image* pImage; UINT frameCount; UINT* frameDelays; int currentFrame; PropertyItem* pPropertyItem;
 };
 
 struct EDIT_SECTION_SAFE {
@@ -131,8 +142,12 @@ static std::vector<Asset*> g_displayAssets;
 static std::vector<std::wstring> g_categories; 
 static std::wstring g_currentCategory = L"ALL", g_searchQuery = L""; 
 static std::set<std::wstring> g_favPaths; 
+static std::set<std::wstring> g_fixedPaths; 
 static bool g_sortFavFirst = false;
 static int g_gifSpeedPercent = 100;
+
+static int g_winX = 100, g_winY = 100, g_winW = 360, g_winH = 550;
+static int g_dlgX = -1, g_dlgY = -1;
 
 static int g_scrollY = 0, g_selectedIndex = -1, g_contextTargetIndex = -1, g_hoverIndex = -1;
 static std::string g_tempAliasData; 
@@ -149,31 +164,16 @@ static UINT* g_addFrameDelays = nullptr;
 static int g_addCurrentFrame = 0;
 static PropertyItem* g_pAddPropertyItem = nullptr;
 
+static std::wstring g_lastTempPath = L"";
+
 // ============================================================
 // 前方宣言
 // ============================================================
-void RefreshAssets(bool reloadFav);
-void UpdateDisplayList();
-void ClearAssets();
-void ScanDirectory(const std::wstring& dir, const std::wstring& category);
-void UpdateAddPreviewImage();
-void OpenAddDialog(const std::string& data, bool isEdit);
-void OpenSettings();
-void StartSnipping();
-void SaveFavorites();
-void LoadFavorites();
-static void ToggleFavorite(const std::wstring& path);
-int ShowDarkMsg(HWND parent, LPCWSTR text, LPCWSTR title, UINT type);
-void RegisterCustomDialogs();
-void OnShowMainWindow(EDIT_SECTION_SAFE* edit); 
-static void DrawContent(HDC hdc, int w, int h);
-static void DrawTitleBar(HDC hdc, int w, LPCWSTR title);
-static void DrawDarkButton(LPDRAWITEMSTRUCT dis);
-static void DrawWindowBorder(HWND hwnd);
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 // ============================================================
-// 1. ユーティリティ
+// 1. ユーティリティ & 設定ファイル処理 (Win32 API)
 // ============================================================
 static std::wstring ToLower(const std::wstring& s) {
     std::wstring ret = s;
@@ -186,7 +186,11 @@ static std::wstring GetFavFilePath() {
     PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetFavorites.txt"); 
     return path; 
 }
-
+static std::wstring GetFixedFilePath() { 
+    wchar_t path[MAX_PATH]; GetModuleFileNameW(g_hInst, path, MAX_PATH); 
+    PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetFixed.txt"); 
+    return path; 
+}
 static std::wstring GetConfigPath() { 
     wchar_t path[MAX_PATH]; GetModuleFileNameW(g_hInst, path, MAX_PATH); 
     PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetConfig.ini"); 
@@ -200,32 +204,78 @@ static void InitBaseDir() {
     g_baseDir = path; CreateDirectoryW(g_baseDir.c_str(), nullptr);
 }
 
+// Win32 API File I/O
+static std::string ReadFileContent(const std::wstring& path) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return "";
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    if (fileSize == 0 || fileSize == INVALID_FILE_SIZE) { CloseHandle(hFile); return ""; }
+    std::vector<char> buffer(fileSize); DWORD bytesRead = 0;
+    ReadFile(hFile, buffer.data(), fileSize, &bytesRead, NULL);
+    CloseHandle(hFile);
+    return std::string(buffer.begin(), buffer.begin() + bytesRead);
+}
+
+static void WriteFileContent(const std::wstring& path, const std::string& content) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    DWORD bytesWritten = 0;
+    WriteFile(hFile, content.c_str(), (DWORD)content.size(), &bytesWritten, NULL);
+    CloseHandle(hFile);
+}
+
+static void RemoveLinesStartingWith(std::string& str, const std::string& prefix) {
+    std::stringstream ss(str); std::string line, output;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.find(prefix) == 0) continue;
+        output += line + "\r\n";
+    }
+    str = output;
+}
+
 void SaveFavorites() { 
-    std::ofstream ofs(GetFavFilePath()); 
-    for (const auto& path : g_favPaths) { 
-        int sw = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, NULL, 0, NULL, NULL);
-        std::vector<char> buf(sw);
-        WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, buf.data(), sw, NULL, NULL);
-        ofs << buf.data() << std::endl; 
-    } 
+    std::string data; for(const auto& p : g_favPaths) { 
+        int sz = WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, NULL, 0, NULL, NULL);
+        if(sz > 0) { std::vector<char> buf(sz); WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, buf.data(), sz, NULL, NULL); data += buf.data(); data += "\r\n"; }
+    }
+    WriteFileContent(GetFavFilePath(), data);
 }
-
 void LoadFavorites() { 
-    g_favPaths.clear(); std::ifstream ifs(GetFavFilePath()); std::string line; 
-    while (std::getline(ifs, line)) { 
-        if (!line.empty() && line.back() == '\r') line.pop_back(); 
-        if (!line.empty()) {
-            int sw = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, NULL, 0);
-            std::vector<wchar_t> wb(sw);
-            MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, wb.data(), sw);
-            g_favPaths.insert(std::wstring(wb.data()));
-        }
-    } 
+    g_favPaths.clear(); std::string data = ReadFileContent(GetFavFilePath());
+    std::stringstream ss(data); std::string line;
+    while(std::getline(ss, line)) {
+        if(!line.empty() && line.back() == '\r') line.pop_back();
+        if(line.empty()) continue;
+        int sz = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, NULL, 0);
+        if(sz > 0) { std::vector<wchar_t> buf(sz); MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, buf.data(), sz); g_favPaths.insert(std::wstring(buf.data())); }
+    }
 }
-
 static void ToggleFavorite(const std::wstring& path) { 
     if (g_favPaths.count(path)) g_favPaths.erase(path); else g_favPaths.insert(path); 
     SaveFavorites(); 
+}
+
+void SaveFixedFrames() { 
+    std::string data; for(const auto& p : g_fixedPaths) { 
+        int sz = WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, NULL, 0, NULL, NULL);
+        if(sz > 0) { std::vector<char> buf(sz); WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, buf.data(), sz, NULL, NULL); data += buf.data(); data += "\r\n"; }
+    }
+    WriteFileContent(GetFixedFilePath(), data);
+}
+void LoadFixedFrames() { 
+    g_fixedPaths.clear(); std::string data = ReadFileContent(GetFixedFilePath());
+    std::stringstream ss(data); std::string line;
+    while(std::getline(ss, line)) {
+        if(!line.empty() && line.back() == '\r') line.pop_back();
+        if(line.empty()) continue;
+        int sz = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, NULL, 0);
+        if(sz > 0) { std::vector<wchar_t> buf(sz); MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, buf.data(), sz); g_fixedPaths.insert(std::wstring(buf.data())); }
+    } 
+}
+static void ToggleFixedFrame(const std::wstring& path) { 
+    if (g_fixedPaths.count(path)) g_fixedPaths.erase(path); else g_fixedPaths.insert(path); 
+    SaveFixedFrames(); 
 }
 
 static void SaveConfig() { 
@@ -234,6 +284,36 @@ static void SaveConfig() {
 static void LoadConfig() { 
     g_gifSpeedPercent = GetPrivateProfileIntW(L"Settings", L"GifSpeed", 100, GetConfigPath().c_str()); 
     if (g_gifSpeedPercent < 10) g_gifSpeedPercent = 100;
+}
+
+static void SaveWindowPos(HWND hwnd, bool isDialog) {
+    if (!hwnd) return;
+    RECT rc; if (!GetWindowRect(hwnd, &rc)) return;
+    std::wstring path = GetConfigPath();
+    if (!isDialog) {
+        g_winX = rc.left; g_winY = rc.top; g_winW = rc.right - rc.left; g_winH = rc.bottom - rc.top;
+        WritePrivateProfileStringW(L"Window", L"X", std::to_wstring(g_winX).c_str(), path.c_str());
+        WritePrivateProfileStringW(L"Window", L"Y", std::to_wstring(g_winY).c_str(), path.c_str());
+        WritePrivateProfileStringW(L"Window", L"W", std::to_wstring(g_winW).c_str(), path.c_str());
+        WritePrivateProfileStringW(L"Window", L"H", std::to_wstring(g_winH).c_str(), path.c_str());
+    } else {
+        g_dlgX = rc.left; g_dlgY = rc.top;
+        WritePrivateProfileStringW(L"Dialog", L"X", std::to_wstring(g_dlgX).c_str(), path.c_str());
+        WritePrivateProfileStringW(L"Dialog", L"Y", std::to_wstring(g_dlgY).c_str(), path.c_str());
+    }
+}
+
+static void LoadWindowConfig() {
+    std::wstring path = GetConfigPath();
+    g_winX = GetPrivateProfileIntW(L"Window", L"X", 100, path.c_str());
+    g_winY = GetPrivateProfileIntW(L"Window", L"Y", 100, path.c_str());
+    g_winW = GetPrivateProfileIntW(L"Window", L"W", 360, path.c_str());
+    g_winH = GetPrivateProfileIntW(L"Window", L"H", 550, path.c_str());
+    g_dlgX = GetPrivateProfileIntW(L"Dialog", L"X", -1, path.c_str());
+    g_dlgY = GetPrivateProfileIntW(L"Dialog", L"Y", -1, path.c_str());
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    if (g_winW < 100) g_winW = 360; if (g_winH < 100) g_winH = 550;
+    if (g_winX > sw - 50) g_winX = 0; if (g_winY > sh - 50) g_winY = 0;
 }
 
 static std::wstring GetUniqueFileName(const std::wstring& dir, const std::wstring& name) {
@@ -290,37 +370,8 @@ static bool GenerateThumbnail(const std::wstring& srcPath, const std::wstring& d
     return false;
 }
 
-// ------------------------------------------------------------
-// 文字列処理
-// ------------------------------------------------------------
-static void RemoveLinesStartingWith(std::string& str, const std::string& prefix) {
-    std::stringstream ss(str); std::string line, output;
-    while (std::getline(ss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.find(prefix) == 0) continue;
-        output += line + "\r\n";
-    }
-    str = output;
-}
-static bool ParseFrame(const std::string& data, int& outStart, int& outEnd) {
-    std::string key = "frame="; size_t pos = data.find(key); if (pos == std::string::npos) return false;
-    size_t startPos = pos + key.length(); size_t commaPos = data.find(',', startPos);
-    size_t endLinePos = data.find_first_of("\r\n", startPos); if (endLinePos == std::string::npos) endLinePos = data.length();
-    if (commaPos != std::string::npos && commaPos < endLinePos) {
-        try { outStart = std::stoi(data.substr(startPos, commaPos - startPos)); outEnd = std::stoi(data.substr(commaPos + 1, endLinePos - (commaPos + 1))); return true; } catch (...) {}
-    } return false;
-}
-static int FindLayerByFrame(void* ptr, int targetStart, int targetEnd) {
-    char* base = (char*)ptr; int s = *(int*)(base + 64); int e = *(int*)(base + 68); int l = *(int*)(base + 96);
-    if (s == targetStart && e == targetEnd) return l;
-    for (int offset = -512; offset <= 512; offset += 4) {
-        s = *(int*)(base + offset); e = *(int*)(base + offset + 4); int l_cand = *(int*)(base + offset + 8);
-        if (s == targetStart && e == targetEnd && l_cand >= 0 && l_cand < 100 && l_cand != (e - s)) return l_cand;
-    } return -1;
-}
-
 // ============================================================
-// 2. ドラッグ＆ドロップ実装 (COM)
+// 2. ドラッグ＆ドロップ実装 (COM) - 前方定義
 // ============================================================
 class CEnumFormatEtc : public IEnumFORMATETC {
     long m_cRef; int m_nIndex;
@@ -494,11 +545,18 @@ void ScanDirectory(const std::wstring& dir, const std::wstring& category) {
     if (hF != INVALID_HANDLE_VALUE) {
         do {
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            
+            
+            if (wcsncmp(fd.cFileName, L"_auto_", 6) == 0) continue;
+
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { ScanDirectory(dir + L"\\" + fd.cFileName, fd.cFileName); }
             else {
                 std::wstring fn = fd.cFileName; size_t ep = fn.find_last_of(L".");
                 if (ep != std::wstring::npos && fn.substr(ep) == L".object") {
-                    Asset a; a.name = fn.substr(0, ep); a.path = dir + L"\\" + fn; a.category = category; a.isFavorite = (g_favPaths.count(a.path) > 0);
+                    Asset a; a.name = fn.substr(0, ep); a.path = dir + L"\\" + fn; a.category = category; 
+                    a.isFavorite = (g_favPaths.count(a.path) > 0);
+                    a.isFixedFrame = (g_fixedPaths.count(a.path) > 0);
+                    
                     a.pImage = nullptr; a.frameCount = 0; a.frameDelays = nullptr; a.currentFrame = 0; a.pPropertyItem = nullptr;
                     std::wstring p1 = dir + L"\\" + a.name + L".png", p2 = dir + L"\\" + a.name + L".gif", lp = L"";
                     if (PathFileExistsW(p2.c_str())) lp = p2; else if (PathFileExistsW(p1.c_str())) lp = p1;
@@ -517,9 +575,32 @@ void ScanDirectory(const std::wstring& dir, const std::wstring& category) {
         } while (FindNextFileW(hF, &fd)); FindClose(hF);
     }
 }
-void UpdateDisplayList() { g_displayAssets.clear(); std::wstring sl = ToLower(g_searchQuery); for (auto& a : g_assets) { if ((g_currentCategory == L"ALL" || a.category == g_currentCategory) && (sl.empty() || ToLower(a.name).find(sl) != std::wstring::npos)) g_displayAssets.push_back(&a); } std::sort(g_displayAssets.begin(), g_displayAssets.end(), [](Asset* a, Asset* b) { if (g_sortFavFirst && a->isFavorite != b->isFavorite) return a->isFavorite > b->isFavorite; return a->name < b->name; }); if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE); }
+void UpdateDisplayList() { 
+    g_displayAssets.clear(); 
+    g_selectedIndex = -1; g_hoverIndex = -1;
+    std::wstring sl = ToLower(g_searchQuery); 
+    for (auto& a : g_assets) { 
+        if ((g_currentCategory == L"ALL" || a.category == g_currentCategory) && (sl.empty() || ToLower(a.name).find(sl) != std::wstring::npos)) 
+            g_displayAssets.push_back(&a); 
+    } 
+    std::sort(g_displayAssets.begin(), g_displayAssets.end(), [](Asset* a, Asset* b) { 
+        if (g_sortFavFirst && a->isFavorite != b->isFavorite) return a->isFavorite > b->isFavorite; 
+        return a->name < b->name; 
+    }); 
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE); 
+}
 void RefreshAssets(bool reloadFav) { 
-    InitBaseDir(); if (reloadFav) LoadFavorites(); LoadConfig(); ClearAssets(); ScanDirectory(g_baseDir, L"Main"); 
+    InitBaseDir(); if (reloadFav) LoadFavorites(); 
+    LoadFixedFrames(); 
+    LoadConfig(); 
+    
+    
+    if (!g_lastTempPath.empty()) {
+        DeleteFileW(g_lastTempPath.c_str());
+        g_lastTempPath = L"";
+    }
+
+    ClearAssets(); ScanDirectory(g_baseDir, L"Main"); 
     g_categories.clear(); std::set<std::wstring> cs; for(auto& a : g_assets) cs.insert(a.category);
     if(g_hCombo) { SendMessage(g_hCombo, CB_RESETCONTENT, 0, 0); SendMessage(g_hCombo, CB_ADDSTRING, 0, (LPARAM)L"すべて (ALL)"); g_categories.push_back(L"ALL"); for(auto& c : cs) { SendMessage(g_hCombo, CB_ADDSTRING, 0, (LPARAM)c.c_str()); g_categories.push_back(c); } SendMessage(g_hCombo, CB_SETCURSEL, 0, 0); }
     g_currentCategory = L"ALL"; UpdateDisplayList(); 
@@ -568,7 +649,14 @@ void UpdateAddPreviewImage() {
 
 static LRESULT CALLBACK SnipWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_KEYDOWN: if (wp == VK_ESCAPE) { DestroyWindow(hwnd); if (g_hDlg) { ShowWindow(g_hDlg, SW_SHOW); SetForegroundWindow(g_hDlg); } else if (g_hwnd) { ShowWindow(g_hwnd, SW_SHOW); } } return 0;
+    case WM_KEYDOWN: 
+        if (wp == VK_ESCAPE) { 
+            ReleaseCapture();
+            DestroyWindow(hwnd); 
+            if (g_hDlg) { ShowWindow(g_hDlg, SW_SHOW); SetForegroundWindow(g_hDlg); } 
+            else if (g_hwnd) { ShowWindow(g_hwnd, SW_SHOW); } 
+        } 
+        return 0;
     case WM_LBUTTONDOWN: g_isSnipping = true; g_snipStart.x = GET_X_LPARAM(lp); g_snipStart.y = GET_Y_LPARAM(lp); g_snipEnd = g_snipStart; SetCapture(hwnd); return 0;
     case WM_MOUSEMOVE: if (g_isSnipping) { g_snipEnd.x = GET_X_LPARAM(lp); g_snipEnd.y = GET_Y_LPARAM(lp); InvalidateRect(hwnd, NULL, FALSE); } return 0;
     case WM_LBUTTONUP: if (g_isSnipping) {
@@ -664,10 +752,28 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else 
                     CopyFileW(g_tempImgPath.c_str(), ip.c_str(), FALSE);
             }
+            
+            
+            std::wstring oldBase = L"";
+            if (!g_editOrgPath.empty()) oldBase = g_editOrgPath.substr(0, g_editOrgPath.find_last_of(L"."));
+
             if (!g_editOrgPath.empty()) MoveFileW(g_editOrgPath.c_str(), sp.c_str());
-            else { std::ofstream ofs(sp, std::ios::binary); ofs.write(g_tempAliasData.data(), g_tempAliasData.size()); }
+            else { WriteFileContent(sp, g_tempAliasData); }
             
-            
+            // 画像の移動
+            if (!oldBase.empty()) {
+                std::wstring newBase = sd + L"\\" + fn;
+                if (oldBase != newBase) {
+                    if (!g_isImageRemoved && g_tempImgPath.empty()) {
+                        MoveFileW((oldBase + L".png").c_str(), (newBase + L".png").c_str());
+                        MoveFileW((oldBase + L".gif").c_str(), (newBase + L".gif").c_str());
+                    } else if (!g_tempImgPath.empty()) {
+                        DeleteFileW((oldBase + L".png").c_str());
+                        DeleteFileW((oldBase + L".gif").c_str());
+                    }
+                }
+            }
+
             RefreshAssets(false); 
             if(g_hwnd) { ShowWindow(g_hwnd, SW_SHOW); SetForegroundWindow(g_hwnd); InvalidateRect(g_hwnd, NULL, FALSE); }
             DestroyWindow(hwnd);
@@ -676,12 +782,25 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_DESTROY: 
+        SaveWindowPos(hwnd, true); 
         if (g_pAddPreviewImage) { delete g_pAddPreviewImage; g_pAddPreviewImage = nullptr; }
         if (g_pAddPreviewStream) { g_pAddPreviewStream->Release(); g_pAddPreviewStream = nullptr; }
         g_hDlg = nullptr; return 0;
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
-void OpenAddDialog(const std::string& data, bool isEdit) { if (g_hDlg) { SetForegroundWindow(g_hDlg); return; } g_tempAliasData = data; if (!isEdit) g_editOrgPath = L""; g_isImageRemoved = false; g_tempImgPath = L""; WNDCLASSW wc = {0}; wc.lpfnWndProc = AddDlgProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAsset_Add"; wc.hbrBackground = g_hBrBg; RegisterClassW(&wc); int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN); g_hDlg = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"MyAsset_Add", L"アセット", WS_POPUP|WS_VISIBLE|WS_THICKFRAME, (sw-360)/2, (sh-400)/2, 360, 400, g_hwnd, nullptr, g_hInst, nullptr); }
+
+void OpenAddDialog(const std::string& data, bool isEdit) { 
+    if (g_hDlg) { SetForegroundWindow(g_hDlg); return; } 
+    g_tempAliasData = data; if (!isEdit) g_editOrgPath = L""; g_isImageRemoved = false; g_tempImgPath = L""; 
+    
+    LoadWindowConfig();
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    int x = (g_dlgX == -1) ? (sw - 360) / 2 : g_dlgX;
+    int y = (g_dlgY == -1) ? (sh - 400) / 2 : g_dlgY;
+    
+    WNDCLASSW wc = {0}; wc.lpfnWndProc = AddDlgProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAsset_Add"; wc.hbrBackground = g_hBrBg; RegisterClassW(&wc); 
+    g_hDlg = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"MyAsset_Add", L"アセット", WS_POPUP|WS_VISIBLE|WS_THICKFRAME, x, y, 360, 400, g_hwnd, nullptr, g_hInst, nullptr); 
+}
 
 // ============================================================
 // 8. メイン描画 & プロシージャ (WndProc)
@@ -689,7 +808,7 @@ void OpenAddDialog(const std::string& data, bool isEdit) { if (g_hDlg) { SetFore
 static void DrawContent(HDC hdc, int w, int h) {
     RECT rcA = {0,0,w,h}; FillRect(hdc, &rcA, g_hBrBg); 
     
-    // ★リスト描画 (先に描画)
+    // ★リスト描画
     int yO = TITLE_H - g_scrollY; HRGN hr = CreateRectRgn(0, TITLE_H, w, h - FOOTER_H); SelectClipRgn(hdc, hr);
     Graphics g(hdc); int cols = (std::max)(1, w / MIN_ITEM_WIDTH); int cw = w / cols;
     for (int i = 0; i < (int)g_displayAssets.size(); i++) {
@@ -700,24 +819,29 @@ static void DrawContent(HDC hdc, int w, int h) {
         Asset* p = g_displayAssets[i];
         if (p->pImage) { if (p->frameCount > 1) { GUID gt = FrameDimensionTime; p->pImage->SelectActiveFrame(&gt, p->currentFrame); } g.DrawImage(p->pImage, x + 7, y + 11, THUMB_W, THUMB_H); }
         if (p->isFavorite) { SetTextColor(hdc, RGB(255, 215, 0)); SelectObject(hdc, g_hFontUI); RECT rs = {ri.right - 25, ri.top + 5, ri.right - 5, ri.top + 25}; SetBkMode(hdc, TRANSPARENT); DrawTextW(hdc, L"★", -1, &rs, DT_RIGHT); }
+        
+        // ★固定フレームマーク描画
+        if (p->isFixedFrame) {
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            SolidBrush brushCyan(Color(255, 31, 205, 219));
+            g.FillEllipse(&brushCyan, (INT)ri.right - 18, (INT)ri.bottom - 18, 10, 10);
+            g.SetSmoothingMode(SmoothingModeDefault);
+        }
+
         SetBkMode(hdc, TRANSPARENT); 
         SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontList); RECT rn = {x + THUMB_W + 15, y + 15, ri.right - 30, y + 45}; DrawTextW(hdc, p->name.c_str(), -1, &rn, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         SetTextColor(hdc, COL_SUBTEXT); SelectObject(hdc, g_hFontListSub); RECT rc = {x + THUMB_W + 15, y + 50, ri.right - 10, ri.bottom - 5}; DrawTextW(hdc, p->category.c_str(), -1, &rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
-    SelectClipRgn(hdc, NULL); DeleteObject(hr); // クリップ解除
+    SelectClipRgn(hdc, NULL); DeleteObject(hr); 
 
-    // ★タイトルバー (後から描画)
     DrawTitleBar(hdc, w, L"My Asset Manager");
 
-    // ★フッター描画 (後から描画)
     RECT rcF = {0, h - FOOTER_H, w, h}; HBRUSH brF = CreateSolidBrush(COL_FOOTER); FillRect(hdc, &rcF, brF); DeleteObject(brF);
     
-    // 更新ボタン
     RECT rcRef = {w - 70, h - FOOTER_H + 8, w - 10, h - FOOTER_H + 32};
     HBRUSH brRef = CreateSolidBrush(COL_BTN_BG); FillRect(hdc, &rcRef, brRef); DeleteObject(brRef);
     SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontUI); DrawTextW(hdc, L"更新", -1, &rcRef, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
-    // ★優先ボタン
     RECT rcFav = {w - 140, h - FOOTER_H + 8, w - 80, h - FOOTER_H + 32};
     HBRUSH brFav = CreateSolidBrush(g_sortFavFirst ? COL_BTN_ACT : COL_BTN_BG); FillRect(hdc, &rcFav, brFav); DeleteObject(brFav);
     DrawTextW(hdc, L"★優先", -1, &rcFav, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
@@ -739,12 +863,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RefreshAssets(true); return 0;
     }
     case WM_NCCALCSIZE: if(wp) return 0; return DefWindowProc(hwnd, msg, wp, lp);
+    case WM_NCACTIVATE: return DefWindowProc(hwnd, msg, wp, lp);
+    case WM_MOUSEACTIVATE: return MA_ACTIVATE;
+
     case WM_SIZE: { 
         RECT rc; GetClientRect(hwnd, &rc); int y = rc.bottom - FOOTER_H + 8; 
         if (g_hCombo) MoveWindow(g_hCombo, 10, y, 140, 300, TRUE); 
         if (g_hSearch) { int sw = (rc.right - 150) - 160; if (sw < 50) sw = 50; MoveWindow(g_hSearch, 160, y, sw, 24, TRUE); } 
         InvalidateRect(hwnd, nullptr, FALSE); return 0; 
     }
+    case WM_EXITSIZEMOVE:
+        SaveWindowPos(hwnd, false);
+        return 0;
+    
     case WM_TIMER: if (wp == ID_TIMER_HOVER && g_hoverIndex != -1 && g_hoverIndex < (int)g_displayAssets.size()) {
             Asset* p = g_displayAssets[g_hoverIndex]; if (p->frameCount > 1) {
                 p->currentFrame = (p->currentFrame + 1) % p->frameCount; InvalidateRect(hwnd, NULL, FALSE);
@@ -753,13 +884,42 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetTimer(hwnd, ID_TIMER_HOVER, (std::max)(10u, sc), NULL);
             }
         } return 0;
+    
+    case WM_KILLFOCUS:
+        ReleaseCapture();
+        g_isDragCheck = false;
+        g_hoverIndex = -1;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        g_isDragCheck = false;
+        return 0;
+
+    case WM_RBUTTONDOWN:
+    case WM_KEYDOWN:
+        if (g_isDragCheck) {
+            ReleaseCapture();
+            g_isDragCheck = false;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        if (msg == WM_RBUTTONDOWN) goto RBUTTON_HANDLER; 
+        return 0;
+
     case WM_RBUTTONUP: {
+RBUTTON_HANDLER:
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp); RECT rc; GetClientRect(hwnd, &rc);
         if (y > TITLE_H && y < rc.bottom - FOOTER_H) {
             int cols = (std::max)(1, (int)rc.right / MIN_ITEM_WIDTH); int cw = (int)rc.right / cols;
             int idx = ((y - TITLE_H + g_scrollY) / ITEM_HEIGHT) * cols + (x / cw);
             HMENU hm = CreatePopupMenu();
-            if (idx >= 0 && idx < (int)g_displayAssets.size()) { g_contextTargetIndex = idx; Asset* p = g_displayAssets[idx]; AppendMenuW(hm, MF_STRING, IDM_EDIT, L"編集"); AppendMenuW(hm, MF_STRING, IDM_FAVORITE, p->isFavorite ? L"お気に入り解除" : L"お気に入り登録"); AppendMenuW(hm, MF_STRING, IDM_DELETE, L"削除"); }
+            if (idx >= 0 && idx < (int)g_displayAssets.size()) { 
+                g_contextTargetIndex = idx; Asset* p = g_displayAssets[idx]; 
+                AppendMenuW(hm, MF_STRING, IDM_EDIT, L"編集"); 
+                AppendMenuW(hm, MF_STRING, IDM_FAVORITE, p->isFavorite ? L"お気に入り解除" : L"お気に入り登録"); 
+                AppendMenuW(hm, MF_STRING | (p->isFixedFrame ? MF_CHECKED : MF_UNCHECKED), IDM_TOGGLE_FIXED, L"フレーム数を固定する");
+                AppendMenuW(hm, MF_STRING, IDM_DELETE, L"削除"); 
+            }
             else { AppendMenuW(hm, MF_STRING, IDM_SETTINGS, L"プレビュー設定..."); AppendMenuW(hm, MF_STRING, ID_BTN_REFRESH, L"更新"); }
             POINT pt; GetCursorPos(&pt); TrackPopupMenu(hm, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL); DestroyMenu(hm);
         } return 0;
@@ -770,10 +930,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (id == ID_BTN_REFRESH) RefreshAssets(true);
         else if (id == IDM_EDIT && g_contextTargetIndex != -1) { Asset* p = g_displayAssets[g_contextTargetIndex]; if (p->pImage) { delete p->pImage; p->pImage = nullptr; } g_editOrgPath = p->path; g_editName = p->name; g_editCat = p->category; OpenAddDialog("", true); }
         else if (id == IDM_FAVORITE && g_contextTargetIndex != -1) { ToggleFavorite(g_displayAssets[g_contextTargetIndex]->path); RefreshAssets(false); }
+        else if (id == IDM_TOGGLE_FIXED && g_contextTargetIndex != -1) { 
+            ToggleFixedFrame(g_displayAssets[g_contextTargetIndex]->path); 
+            RefreshAssets(false); 
+        }
         else if (id == IDM_DELETE && g_contextTargetIndex != -1) { 
             Asset* p = g_displayAssets[g_contextTargetIndex]; 
             if (ShowDarkMsg(hwnd, L"削除しますか？", L"確認", MB_YESNO) == IDYES) { 
-                
                 if (p->pImage) { delete p->pImage; p->pImage = nullptr; } 
                 DeleteFileW(p->path.c_str()); 
                 std::wstring base = p->path.substr(0, p->path.find_last_of(L"."));
@@ -787,12 +950,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_PAINT: { PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); RECT rc; GetClientRect(hwnd, &rc); HDC mc = CreateCompatibleDC(hdc); HBITMAP mb = CreateCompatibleBitmap(hdc, rc.right, rc.bottom); SelectObject(mc, mb); DrawContent(mc, rc.right, rc.bottom); BitBlt(hdc, 0, 0, rc.right, rc.bottom, mc, 0, 0, SRCCOPY); DeleteObject(mb); DeleteDC(mc); EndPaint(hwnd, &ps); return 0; }
     case WM_LBUTTONDOWN: {
+        SetFocus(hwnd); 
+
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp); RECT rc; GetClientRect(hwnd, &rc);
         if (y > TITLE_H && y < rc.bottom - FOOTER_H) {
+            SetCapture(hwnd); 
             int cols = (std::max)(1, (int)rc.right / MIN_ITEM_WIDTH); int cw = (int)rc.right / cols;
             int idx = ((y - TITLE_H + g_scrollY) / ITEM_HEIGHT) * cols + (x / cw);
             if (idx >= 0 && idx < (int)g_displayAssets.size()) { g_selectedIndex = idx; g_isDragCheck = true; g_dragStartPt = {x, y}; InvalidateRect(hwnd, nullptr, FALSE); }
-        } else if (y >= rc.bottom - FOOTER_H) {
+        } 
+        else if (y >= rc.bottom - FOOTER_H) {
             if (x >= rc.right - 70 && x <= rc.right - 10) RefreshAssets(true);
             else if (x >= rc.right - 140 && x <= rc.right - 80) { g_sortFavFirst = !g_sortFavFirst; UpdateDisplayList(); }
         }
@@ -802,7 +969,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_hoverIndex != -1) { KillTimer(hwnd, ID_TIMER_HOVER); g_hoverIndex = -1; InvalidateRect(hwnd, NULL, FALSE); } 
         g_isMouseTracking = false; return 0; 
     }
-    case WM_LBUTTONUP: { int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp); RECT rc; GetClientRect(hwnd, &rc); if (y < TITLE_H && x > rc.right - 40) ShowWindow(hwnd, SW_HIDE); g_isDragCheck = false; return 0; }
+    case WM_LBUTTONUP: { 
+        ReleaseCapture(); 
+        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp); RECT rc; GetClientRect(hwnd, &rc); 
+        if (y < TITLE_H && x > rc.right - 40) { SaveWindowPos(hwnd, false); ShowWindow(hwnd, SW_HIDE); } 
+        g_isDragCheck = false; return 0; 
+    }
     case WM_MOUSEMOVE: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp); RECT rc; GetClientRect(hwnd, &rc);
         if (!g_isMouseTracking) { TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 }; TrackMouseEvent(&tme); g_isMouseTracking = true; }
@@ -813,7 +985,52 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else { if (g_hoverIndex != -1) { KillTimer(hwnd, ID_TIMER_HOVER); g_hoverIndex = -1; } }
         } else { if (g_hoverIndex != -1) { KillTimer(hwnd, ID_TIMER_HOVER); g_hoverIndex = -1; } }
         
-        if (g_isDragCheck && g_selectedIndex != -1) { if (abs(x - g_dragStartPt.x) > 5 || abs(y - g_dragStartPt.y) > 5) { g_isDragCheck = false; IDataObject* po; if (SUCCEEDED(CreateFileDropDataObject(g_displayAssets[g_selectedIndex]->path, &po))) { CDropSource* ps = new CDropSource(); DWORD de; DoDragDrop(po, ps, DROPEFFECT_COPY, &de); po->Release(); } } }
+        // D&D時のファイル作成ロジック
+        if (g_isDragCheck && g_selectedIndex != -1 && g_selectedIndex < (int)g_displayAssets.size()) { 
+            if (abs(x - g_dragStartPt.x) > 5 || abs(y - g_dragStartPt.y) > 5) { 
+                
+                
+                if (!g_lastTempPath.empty()) {
+                    DeleteFileW(g_lastTempPath.c_str());
+                    g_lastTempPath = L"";
+                }
+
+                ReleaseCapture(); 
+                g_isDragCheck = false; 
+
+                Asset* p = g_displayAssets[g_selectedIndex];
+                std::wstring dragPath = p->path;
+                std::wstring tempPath;
+
+                // ファイル内容を読み込む
+                std::string content = ReadFileContent(p->path);
+                
+                // [Object] から始まる新しい形式のファイルのみ frame行を削除する
+                bool isModernFormat = (content.find("[Object]") == 0); 
+
+                if (!p->isFixedFrame && isModernFormat) {
+                    RemoveLinesStartingWith(content, "frame=");
+                    
+                    std::wstring dir = p->path.substr(0, p->path.find_last_of(L"\\") + 1);
+                    tempPath = dir + L"_auto_" + p->name + L".object"; 
+                    
+                    WriteFileContent(tempPath, content);
+                    dragPath = tempPath;
+                    g_lastTempPath = tempPath; 
+                }
+
+                IDataObject* po; 
+                if (SUCCEEDED(CreateFileDropDataObject(dragPath, &po))) { 
+                    CDropSource* ps = new CDropSource(); 
+                    DWORD de; 
+                    DoDragDrop(po, ps, DROPEFFECT_COPY, &de); 
+                    po->Release(); 
+                } 
+                
+                g_selectedIndex = -1;
+                InvalidateRect(hwnd, NULL, FALSE);
+            } 
+        }
         return 0;
     }
     case WM_MOUSEWHEEL: { 
@@ -843,6 +1060,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } return h; 
     }
     case WM_DESTROY: 
+        SaveWindowPos(hwnd, false); 
+        
+        if (!g_lastTempPath.empty()) DeleteFileW(g_lastTempPath.c_str());
+
         if(g_hDlg) DestroyWindow(g_hDlg);
         if(g_hSettingDlg) DestroyWindow(g_hSettingDlg);
         if(g_hSnipWnd) DestroyWindow(g_hSnipWnd);
@@ -855,9 +1076,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 }
 
-// ============================================================
-// 9. AviUtl エントリポイント
-// ============================================================
+
 void OnAddAsset(EDIT_SECTION_SAFE* edit) {
     if (!edit || !edit->get_selected_object_num) return; int count = edit->get_selected_object_num(); if (count <= 0) { ShowDarkMsg(NULL, L"オブジェクトを選択してください", L"Info", MB_OK); return; }
     std::string bodyData; for(int i = 0; i < count; i++) { void* obj = edit->get_selected_object(i); if (obj) { LPCSTR raw = edit->get_object_alias(obj); if (raw) { std::string s = raw; bodyData += s + "\r\n"; } } }
@@ -873,13 +1092,14 @@ void OnShowMainWindow(EDIT_SECTION_SAFE* edit) {
 }
 
 void CreatePluginWindow() { 
+    LoadWindowConfig();
     WNDCLASSW wc = {0}; wc.lpfnWndProc = WndProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAssetMgr_Modern"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = g_hBrBg; wc.style = CS_HREDRAW | CS_VREDRAW; RegisterClassW(&wc); 
-    g_hwnd = CreateWindowExW(WS_EX_TOPMOST, L"MyAssetMgr_Modern", L"My Asset Manager", WS_POPUP | WS_CLIPCHILDREN | WS_THICKFRAME, 100, 100, 360, 550, nullptr, nullptr, g_hInst, nullptr); 
+    g_hwnd = CreateWindowExW(WS_EX_TOPMOST, L"MyAssetMgr_Modern", L"My Asset Manager", WS_POPUP | WS_CLIPCHILDREN | WS_THICKFRAME, g_winX, g_winY, g_winW, g_winH, nullptr, nullptr, g_hInst, nullptr); 
 }
 
 extern "C" __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) { 
     HMODULE hm; GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)RegisterPlugin, &hm); g_hInst = (HINSTANCE)hm;
-    g_host = host; host->set_plugin_information(L"My Asset Manager v1.1"); 
+    g_host = host; host->set_plugin_information(L"My Asset Manager v2.9"); 
     RegisterCustomDialogs(); CreatePluginWindow(); 
     if (g_hwnd) host->register_window_client(L"My Asset Manager", g_hwnd); 
     if (host->register_edit_menu) host->register_edit_menu(L"表示 > My Asset Manager", OnShowMainWindow); 
