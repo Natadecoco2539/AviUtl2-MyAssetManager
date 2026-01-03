@@ -1099,7 +1099,7 @@ void CreatePluginWindow() {
 
 extern "C" __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) { 
     HMODULE hm; GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)RegisterPlugin, &hm); g_hInst = (HINSTANCE)hm;
-    g_host = host; host->set_plugin_information(L"My Asset Manager v2.9"); 
+    g_host = host; host->set_plugin_information(L"My Asset Manager v1.2"); 
     RegisterCustomDialogs(); CreatePluginWindow(); 
     if (g_hwnd) host->register_window_client(L"My Asset Manager", g_hwnd); 
     if (host->register_edit_menu) host->register_edit_menu(L"表示 > My Asset Manager", OnShowMainWindow); 
@@ -1112,3 +1112,4 @@ extern "C" __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
         host->register_object_menu(L"MyAsset: 追加", OnAddAsset);
     }
 }
+
