@@ -1,6 +1,6 @@
 // ------------------------------------------------------------
 // MyAssetManager.cpp
-// v1.3
+// v1.4
 // ------------------------------------------------------------
 
 #define NOMINMAX
@@ -204,6 +204,50 @@ static std::wstring ToLower(const std::wstring& s) {
     std::wstring ret = s;
     std::transform(ret.begin(), ret.end(), ret.begin(), ::towlower);
     return ret;
+}
+
+static int GetMaxScrollY(HWND hwnd) {
+    RECT rc = {0};
+    GetClientRect(hwnd, &rc);
+    int clientW = (int)(rc.right - rc.left);
+    int clientH = (int)(rc.bottom - rc.top);
+    int viewH = clientH - TITLE_H - FOOTER_H;
+    if (viewH <= 0) return 0;
+
+    int cols = (std::max)(1, clientW / MIN_ITEM_WIDTH);
+    int rows = ((int)g_displayAssets.size() + cols - 1) / cols;
+    int contentH = rows * ITEM_HEIGHT;
+    return (std::max)(0, contentH - viewH);
+}
+
+static void UpdateScrollBar(HWND hwnd) {
+    if (!hwnd) return;
+
+    RECT rc = {0};
+    GetClientRect(hwnd, &rc);
+    int clientH = (int)(rc.bottom - rc.top);
+    int viewH = clientH - TITLE_H - FOOTER_H;
+    int maxScroll = GetMaxScrollY(hwnd);
+    g_scrollY = (std::max)(0, (std::min)(g_scrollY, maxScroll));
+
+    SCROLLINFO si = {0};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = (maxScroll > 0) ? (maxScroll + (std::max)(1, viewH) - 1) : 0;
+    si.nPage = (UINT)(viewH > 0 ? viewH : 0);
+    si.nPos = g_scrollY;
+    SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+}
+
+static void SetScrollY(HWND hwnd, int newY) {
+    int maxScroll = GetMaxScrollY(hwnd);
+    int clamped = (std::max)(0, (std::min)(newY, maxScroll));
+    if (clamped == g_scrollY) return;
+
+    g_scrollY = clamped;
+    SetScrollPos(hwnd, SB_VERT, g_scrollY, TRUE);
+    InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 static std::string ReadFileContent(const std::wstring& path) {
@@ -664,6 +708,14 @@ static void DrawWindowBorder(HWND hwnd) {
     RECT rb = {0, 0, w, h}; HBRUSH br = CreateSolidBrush(COL_BORDER); FrameRect(hdc, &rb, br); DeleteObject(br); ReleaseDC(hwnd, hdc); 
 }
 
+static void ShowSettingsRefreshMenu(HWND hwnd, int xScreen, int yScreen) {
+    HMENU hm = CreatePopupMenu();
+    AppendMenuW(hm, MF_STRING, IDM_SETTINGS, L"プレビュー設定...");
+    AppendMenuW(hm, MF_STRING, ID_BTN_REFRESH, L"更新");
+    TrackPopupMenu(hm, TPM_RIGHTBUTTON, xScreen, yScreen, 0, hwnd, NULL);
+    DestroyMenu(hm);
+}
+
 // ============================================================
 // 4. カスタムダイアログ
 // ============================================================
@@ -809,7 +861,10 @@ void UpdateDisplayList() {
         if (g_sortFavFirst && a->isFavorite != b->isFavorite) return a->isFavorite > b->isFavorite; 
         return a->name < b->name; 
     }); 
-    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE); 
+    if (g_hwnd) {
+        UpdateScrollBar(g_hwnd);
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
 }
 void RefreshAssets(bool reloadFav) { 
     InitBaseDir(); if (reloadFav) LoadFavorites(); 
@@ -1207,6 +1262,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT rc; GetClientRect(hwnd, &rc); int y = rc.bottom - FOOTER_H + 8; 
         if (g_hCombo) MoveWindow(g_hCombo, 10, y, 140, 300, TRUE); 
         if (g_hSearch) { int sw = (rc.right - 150) - 160; if (sw < 50) sw = 50; MoveWindow(g_hSearch, 160, y, sw, 24, TRUE); } 
+        UpdateScrollBar(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE); return 0; 
     }
     case WM_EXITSIZEMOVE:
@@ -1244,6 +1300,39 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return 0;
+
+    case WM_MOUSEWHEEL: {
+        int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        UINT lines = 3;
+        SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+        int step = (lines == WHEEL_PAGESCROLL) ? (ITEM_HEIGHT * 3) : ((int)lines * SCROLL_SPD);
+        if (step <= 0) step = SCROLL_SPD;
+        SetScrollY(hwnd, g_scrollY - (delta / WHEEL_DELTA) * step);
+        return 0;
+    }
+
+    case WM_VSCROLL: {
+        SCROLLINFO si = {0};
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL;
+        GetScrollInfo(hwnd, SB_VERT, &si);
+
+        int newY = g_scrollY;
+        switch (LOWORD(wp)) {
+        case SB_TOP: newY = 0; break;
+        case SB_BOTTOM: newY = GetMaxScrollY(hwnd); break;
+        case SB_LINEUP: newY -= SCROLL_SPD; break;
+        case SB_LINEDOWN: newY += SCROLL_SPD; break;
+        case SB_PAGEUP: newY -= (int)si.nPage; break;
+        case SB_PAGEDOWN: newY += (int)si.nPage; break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: newY = si.nTrackPos; break;
+        default: break;
+        }
+
+        SetScrollY(hwnd, newY);
+        return 0;
+    }
     
     case WM_KILLFOCUS:
         ReleaseCapture();
@@ -1267,10 +1356,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_RBUTTONDOWN) goto RBUTTON_HANDLER; 
         return 0;
 
+    case WM_NCRBUTTONUP:
+        if (wp == HTCAPTION) {
+            ShowSettingsRefreshMenu(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            return 0;
+        }
+        return DefWindowProc(hwnd, msg, wp, lp);
+
     case WM_RBUTTONUP: {
 RBUTTON_HANDLER:
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp); RECT rc; GetClientRect(hwnd, &rc);
-        if (y > TITLE_H && y < rc.bottom - FOOTER_H) {
+        if (y >= 0 && y < TITLE_H) {
+            POINT pt; GetCursorPos(&pt);
+            ShowSettingsRefreshMenu(hwnd, pt.x, pt.y);
+        }
+        else if (y > TITLE_H && y < rc.bottom - FOOTER_H) {
             int cols = (std::max)(1, (int)rc.right / MIN_ITEM_WIDTH); int cw = (int)rc.right / cols;
             int idx = ((y - TITLE_H + g_scrollY) / ITEM_HEIGHT) * cols + (x / cw);
             HMENU hm = CreatePopupMenu();
@@ -1286,7 +1386,10 @@ RBUTTON_HANDLER:
                 AppendMenuW(hm, flags, IDM_TOGGLE_FIXED, L"フレーム数を固定する");
                 AppendMenuW(hm, MF_STRING, IDM_DELETE, L"削除"); 
             }
-            else { AppendMenuW(hm, MF_STRING, IDM_SETTINGS, L"プレビュー設定..."); AppendMenuW(hm, MF_STRING, ID_BTN_REFRESH, L"更新"); }
+            else {
+                AppendMenuW(hm, MF_STRING, IDM_SETTINGS, L"プレビュー設定...");
+                AppendMenuW(hm, MF_STRING, ID_BTN_REFRESH, L"更新");
+            }
             POINT pt; GetCursorPos(&pt); TrackPopupMenu(hm, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL); DestroyMenu(hm);
         } return 0;
     }
@@ -1511,11 +1614,11 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
 
 void OnShowMainWindow(EDIT_SECTION_SAFE* edit) { if (g_hwnd) { ShowWindow(g_hwnd, SW_RESTORE); ShowWindow(g_hwnd, SW_SHOW); SetForegroundWindow(g_hwnd); } }
 
-void CreatePluginWindow() { LoadWindowConfig(); WNDCLASSW wc = {0}; wc.lpfnWndProc = WndProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAssetMgr_Modern"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = g_hBrBg; wc.style = CS_HREDRAW | CS_VREDRAW; RegisterClassW(&wc); g_hwnd = CreateWindowExW(WS_EX_TOPMOST, L"MyAssetMgr_Modern", L"My Asset Manager", WS_POPUP | WS_CLIPCHILDREN | WS_THICKFRAME, g_winX, g_winY, g_winW, g_winH, nullptr, nullptr, g_hInst, nullptr); }
+void CreatePluginWindow() { LoadWindowConfig(); WNDCLASSW wc = {0}; wc.lpfnWndProc = WndProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAssetMgr_Modern"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = g_hBrBg; wc.style = CS_HREDRAW | CS_VREDRAW; RegisterClassW(&wc); g_hwnd = CreateWindowExW(WS_EX_TOPMOST, L"MyAssetMgr_Modern", L"My Asset Manager", WS_POPUP | WS_CLIPCHILDREN | WS_THICKFRAME | WS_VSCROLL, g_winX, g_winY, g_winW, g_winH, nullptr, nullptr, g_hInst, nullptr); }
 
 extern "C" __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) { 
     HMODULE hm; GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)RegisterPlugin, &hm); g_hInst = (HINSTANCE)hm;
-    g_host = host; host->set_plugin_information(L"My Asset Manager v1.3"); 
+    g_host = host; host->set_plugin_information(L"My Asset Manager v1.4"); 
     RegisterCustomDialogs(); CreatePluginWindow(); 
     if (g_hwnd) host->register_window_client(L"My Asset Manager", g_hwnd); 
     if (host->register_edit_menu) host->register_edit_menu(L"表示 > My Asset Manager", OnShowMainWindow); 
