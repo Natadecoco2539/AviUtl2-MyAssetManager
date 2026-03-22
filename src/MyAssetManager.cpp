@@ -1,6 +1,6 @@
-﻿// ------------------------------------------------------------
+// ------------------------------------------------------------
 // MyAssetManager.cpp
-// v1.6
+// v1.6.1
 // ------------------------------------------------------------
 
 #define NOMINMAX
@@ -115,7 +115,7 @@ static constexpr COLORREF COL_TIP_BORDER = RGB(100, 100, 100);
 static constexpr COLORREF COL_TIP_TEXT   = RGB(230, 230, 230);
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#define MYASSET_VERSION_W L"1.6"
+#define MYASSET_VERSION_W L"1.6.1"
 static const wchar_t* kGithubReleaseBase = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/releases/tag/v";
 static const wchar_t* kGithubBugReportUrl = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/issues/new/choose";
 
@@ -1736,7 +1736,11 @@ void OpenImageFileExplorer(HWND parent) { wchar_t sz[MAX_PATH] = {0}; OPENFILENA
 static bool TriggerGifExportShortcut() {
     HWND hostWnd = g_hwnd ? GetAncestor(g_hwnd, GA_ROOT) : nullptr;
     if (hostWnd && IsWindow(hostWnd)) {
-        ShowWindow(hostWnd, SW_RESTORE);
+        if (IsIconic(hostWnd)) {
+            ShowWindow(hostWnd, SW_RESTORE);
+        } else {
+            ShowWindow(hostWnd, SW_SHOW);
+        }
         SetForegroundWindow(hostWnd);
         SetActiveWindow(hostWnd);
     }
@@ -1756,7 +1760,11 @@ static bool TriggerGifExportShortcut() {
 static void ActivateHostForSelectionRead(HWND requester) {
     HWND hostWnd = g_hwnd ? GetAncestor(g_hwnd, GA_ROOT) : nullptr;
     if (hostWnd && IsWindow(hostWnd)) {
-        ShowWindow(hostWnd, SW_RESTORE);
+        if (IsIconic(hostWnd)) {
+            ShowWindow(hostWnd, SW_RESTORE);
+        } else {
+            ShowWindow(hostWnd, SW_SHOW);
+        }
         SetForegroundWindow(hostWnd);
         SetActiveWindow(hostWnd);
         SetFocus(hostWnd);
