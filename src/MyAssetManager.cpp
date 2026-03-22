@@ -1,6 +1,6 @@
 // ------------------------------------------------------------
 // MyAssetManager.cpp
-// v1.6.1
+// v1.6.2
 // ------------------------------------------------------------
 
 #define NOMINMAX
@@ -54,6 +54,7 @@ using namespace Gdiplus;
 #define ID_TIMER_TOOLTIP        996 
 #define ID_TIMER_GIF_HINT       995
 #define ID_TIMER_GIF_HINT_POLL  994
+#define ID_TIMER_HIDE_MAIN_AFTER_EXPORT 993
 
 #define ID_COMBO_CATEGORY 200
 #define ID_BTN_FAV_SORT   201
@@ -115,7 +116,7 @@ static constexpr COLORREF COL_TIP_BORDER = RGB(100, 100, 100);
 static constexpr COLORREF COL_TIP_TEXT   = RGB(230, 230, 230);
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#define MYASSET_VERSION_W L"1.6.1"
+#define MYASSET_VERSION_W L"1.6.2"
 static const wchar_t* kGithubReleaseBase = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/releases/tag/v";
 static const wchar_t* kGithubBugReportUrl = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/issues/new/choose";
 
@@ -205,6 +206,9 @@ static EDIT_HANDLE_SAFE* g_editHandle = nullptr;
 static bool g_cachedOutputRangeValid = false;
 static int g_cachedOutputRangeStart = 0;
 static int g_cachedOutputRangeEnd = 0;
+static bool g_addDialogRangeValid = false;
+static int g_addDialogRangeStart = 0;
+static int g_addDialogRangeEnd = 0;
 static HINSTANCE g_hInst = nullptr;
 static HWND g_hwnd = nullptr;
 static HWND g_hDlg = nullptr;
@@ -232,6 +236,11 @@ static int g_gifSpeedPercent = 100;
 static bool g_showGifExportGuide = true;
 static bool g_gifExportKeepOriginal = false;
 static bool g_enableGroupDebugDump = false;
+static bool g_enableGifRangeDebug = false;
+static bool g_mainWasVisibleBeforeAddDialog = false;
+static bool g_suppressMainShow = false;
+static bool g_enableMainWindowTrace = true;
+static int g_hideMainAfterExportTicks = 0;
 
 static int g_winX = 100, g_winY = 100, g_winW = 360, g_winH = 550;
 static int g_dlgX = -1, g_dlgY = -1;
@@ -269,6 +278,8 @@ static ULONGLONG g_addGifHoverStartTick = 0;
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static int GetObjectLayerIndex(void* obj);
+static bool SafeReadIntAtOffset(void* obj, int offset, int& outValue);
+static std::string WideToUtf8(const std::wstring& w);
 void OpenAddDialog(const std::string& data, bool isEdit);
 int ShowDarkMsg(HWND parent, LPCWSTR text, LPCWSTR title, UINT type);
 void RefreshAssets(bool reloadFav);
@@ -425,38 +436,65 @@ static int ExtractHeaderIntValue(const std::string& src, const std::string& key)
 }
 
 static bool ExtractHeaderFrameRange(const std::string& src, int& outStart, int& outEnd) {
+    auto parseFramePair = [](const std::string& line, int& s, int& e) -> bool {
+        std::string t = TrimAscii(line);
+        if (t.empty()) return false;
+        if (!StartsWithNoCase(t, "frame")) return false;
+
+        size_t i = 5;
+        while (i < t.size() && isspace((unsigned char)t[i])) i++;
+        if (i >= t.size() || t[i] != '=') return false;
+        i++;
+        while (i < t.size() && isspace((unsigned char)t[i])) i++;
+
+        size_t b1 = i;
+        if (i < t.size() && (t[i] == '+' || t[i] == '-')) i++;
+        size_t d1 = i;
+        while (i < t.size() && isdigit((unsigned char)t[i])) i++;
+        if (d1 == i) return false;
+
+        size_t e1 = i;
+        while (i < t.size() && (isspace((unsigned char)t[i]) || t[i] == ',')) i++;
+
+        size_t b2 = i;
+        if (i < t.size() && (t[i] == '+' || t[i] == '-')) i++;
+        size_t d2 = i;
+        while (i < t.size() && isdigit((unsigned char)t[i])) i++;
+        if (d2 == i) return false;
+        size_t e2 = i;
+
+        try {
+            s = std::stoi(t.substr(b1, e1 - b1));
+            e = std::stoi(t.substr(b2, e2 - b2));
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+
     std::stringstream ss(src);
     std::string line;
-    bool inTopHeader = false;
+    int start = INT_MAX;
+    int end = INT_MIN;
+    bool found = false;
+
     while (std::getline(ss, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         std::string t = TrimAscii(line);
         if (t.empty()) continue;
 
-        if (!inTopHeader) {
-            if (t.front() == '[' && t.back() == ']') {
-                std::string sec = t.substr(1, t.size() - 2);
-                if (sec.find('.') == std::string::npos) inTopHeader = true;
-            }
-            continue;
+        int s = 0, e = 0;
+        if (parseFramePair(t, s, e)) {
+            start = (std::min)(start, s);
+            end = (std::max)(end, e);
+            found = true;
         }
+    }
 
-        if (t.front() == '[' && t.back() == ']') break;
-        if (StartsWithNoCase(t, "frame=")) {
-            std::string v = TrimAscii(t.substr(6));
-            size_t comma = v.find(',');
-            if (comma == std::string::npos) return false;
-            try {
-                int s = std::stoi(TrimAscii(v.substr(0, comma)));
-                int e = std::stoi(TrimAscii(v.substr(comma + 1)));
-                if (e < s) return false;
-                outStart = s;
-                outEnd = e;
-                return true;
-            } catch (...) {
-                return false;
-            }
-        }
+    if (found) {
+        outStart = start;
+        outEnd = end;
+        return true;
     }
     return false;
 }
@@ -626,6 +664,17 @@ static int GetObjectLayerIndex(void* obj) {
     return *(int*)((char*)obj + 0x60); 
 }
 
+static bool TryGetObjectFrameRangeFromMemory(void* obj, int& outStart, int& outEnd) {
+    int s = 0, e = 0;
+    if (!SafeReadIntAtOffset(obj, 0x40, s)) return false;
+    if (!SafeReadIntAtOffset(obj, 0x44, e)) return false;
+    if (e < s) return false;
+    if (s < -1000000 || e > 10000000) return false;
+    outStart = s;
+    outEnd = e;
+    return true;
+}
+
 static bool SafeReadIntAtOffset(void* obj, int offset, int& outValue) {
     if (!obj || offset < 0) return false;
 #if defined(_MSC_VER)
@@ -778,6 +827,80 @@ static std::wstring GetGroupDebugPath() {
     PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetGroupDebug.txt");
     return path;
 }
+static std::wstring GetUiDebugPath() {
+    wchar_t path[MAX_PATH]; GetModuleFileNameW(g_hInst, path, MAX_PATH);
+    PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetUiDebug.txt");
+    return path;
+}
+static void AppendUiDebugLine(const std::string& line) {
+    if (!g_enableMainWindowTrace) return;
+    HANDLE hFile = CreateFileW(GetUiDebugPath().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    std::ostringstream os;
+    os << "[" << st.wYear << "-" << st.wMonth << "-" << st.wDay
+       << " " << st.wHour << ":" << st.wMinute << ":" << st.wSecond << "." << st.wMilliseconds << "] "
+       << line << "\r\n";
+    std::string out = os.str();
+    DWORD written = 0;
+    WriteFile(hFile, out.c_str(), (DWORD)out.size(), &written, NULL);
+    CloseHandle(hFile);
+}
+
+struct UiWinDumpContext {
+    DWORD pid;
+    std::string tag;
+    int count;
+};
+
+static BOOL CALLBACK EnumWindowsForUiDumpProc(HWND hwnd, LPARAM lp) {
+    auto* ctx = (UiWinDumpContext*)lp;
+    if (!ctx) return TRUE;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != ctx->pid) return TRUE;
+
+    wchar_t clsW[256] = {};
+    wchar_t titleW[256] = {};
+    GetClassNameW(hwnd, clsW, 255);
+    GetWindowTextW(hwnd, titleW, 255);
+
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    HWND owner = GetWindow(hwnd, GW_OWNER);
+    HWND rootOwner = GetAncestor(hwnd, GA_ROOTOWNER);
+
+    std::ostringstream os;
+    os << "WinDump[" << ctx->tag << "]"
+       << " hwnd=" << (void*)hwnd
+       << " vis=" << (IsWindowVisible(hwnd) ? 1 : 0)
+       << " en=" << (IsWindowEnabled(hwnd) ? 1 : 0)
+       << " owner=" << (void*)owner
+       << " rootOwner=" << (void*)rootOwner
+       << " style=0x" << std::hex << (unsigned long long)style
+       << " ex=0x" << (unsigned long long)exStyle << std::dec
+       << " class=" << WideToUtf8(clsW)
+       << " title=" << WideToUtf8(titleW);
+    AppendUiDebugLine(os.str());
+    ctx->count++;
+    return TRUE;
+}
+
+static void DumpProcessWindowsForUiDebug(const char* tag) {
+    if (!g_enableMainWindowTrace) return;
+    UiWinDumpContext ctx = {};
+    ctx.pid = GetCurrentProcessId();
+    ctx.tag = tag ? tag : "";
+    ctx.count = 0;
+    AppendUiDebugLine("WinDump begin: " + ctx.tag);
+    EnumWindows(EnumWindowsForUiDumpProc, (LPARAM)&ctx);
+    std::ostringstream os;
+    os << "WinDump end: " << ctx.tag << " count=" << ctx.count;
+    AppendUiDebugLine(os.str());
+}
+
 static void AppendGroupDebugText(const std::string& text) {
     HANDLE hFile = CreateFileW(GetGroupDebugPath().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return;
@@ -902,6 +1025,39 @@ static bool IsGifFile(const std::wstring& path) {
     return (ToLower(ext) == L".gif");
 }
 
+static HWND ResolveHostWindow(HWND requester) {
+    auto normalizeToTopOwner = [](HWND h) -> HWND {
+        HWND cur = h;
+        for (int i = 0; i < 8 && cur && IsWindow(cur); ++i) {
+            HWND owner = GetWindow(cur, GW_OWNER);
+            if (!owner || !IsWindow(owner)) break;
+            cur = owner;
+        }
+        return cur;
+    };
+
+    auto pickHost = [](HWND base) -> HWND {
+        if (!base || !IsWindow(base)) return nullptr;
+        HWND owner = GetWindow(base, GW_OWNER);
+        if (owner && IsWindow(owner) && owner != g_hwnd) return owner;
+        HWND rootOwner = GetAncestor(base, GA_ROOTOWNER);
+        if (rootOwner && IsWindow(rootOwner) && rootOwner != g_hwnd) return rootOwner;
+        return nullptr;
+    };
+
+    HWND host = pickHost(g_hwnd);
+    if (host) return normalizeToTopOwner(host);
+    host = pickHost(requester);
+    if (host) return normalizeToTopOwner(host);
+
+    HWND fg = GetForegroundWindow();
+    if (fg && IsWindow(fg) && fg != g_hwnd) {
+        HWND fgRootOwner = GetAncestor(fg, GA_ROOTOWNER);
+        if (fgRootOwner != g_hwnd) return normalizeToTopOwner(fg);
+    }
+    return nullptr;
+}
+
 static int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
     UINT num = 0, size = 0; GetImageEncodersSize(&num, &size);
     if(size == 0) return -1;
@@ -951,42 +1107,7 @@ static void ApplyRangeFromContextProc(void* param, EDIT_SECTION_OUT_SAFE* edit) 
 }
 
 static bool TryParseFrameRangeFromAliasData(const std::string& alias, int& outStart, int& outEnd) {
-    std::stringstream ss(alias);
-    std::string line;
-    bool inHeader = false;
-    int start = INT_MAX;
-    int end = INT_MIN;
-    while (std::getline(ss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-
-        if (line[0] == '[') {
-            inHeader = false;
-            if (line == "[Object]") inHeader = true;
-            else if (line.size() >= 3 && line[0] == '[' && isdigit((unsigned char)line[1]) && line.find('.') == std::string::npos) inHeader = true;
-            continue;
-        }
-
-        if (!inHeader) continue;
-        if (line.rfind("frame=", 0) == 0) {
-            std::string v = line.substr(6);
-            size_t comma = v.find(',');
-            if (comma == std::string::npos) continue;
-            try {
-                int s = std::stoi(v.substr(0, comma));
-                int e = std::stoi(v.substr(comma + 1));
-                start = (std::min)(start, s);
-                end = (std::max)(end, e);
-            } catch (...) {
-            }
-        }
-    }
-    if (start <= end) {
-        outStart = start;
-        outEnd = end;
-        return true;
-    }
-    return false;
+    return ExtractHeaderFrameRange(alias, outStart, outEnd);
 }
 
 static bool CacheRangeFromCurrentAliasData() {
@@ -995,6 +1116,20 @@ static bool CacheRangeFromCurrentAliasData() {
     if (!TryParseFrameRangeFromAliasData(g_tempAliasData, s, e)) return false;
     g_cachedOutputRangeStart = s;
     g_cachedOutputRangeEnd = e;
+    g_cachedOutputRangeValid = true;
+    return true;
+}
+
+static bool CacheRangeFromTimelineSelection() {
+    g_cachedOutputRangeValid = false;
+    if (!g_editHandle || !g_editHandle->call_edit_section_param) return false;
+
+    OutputRangeContext ctx = {0, 0, false};
+    if (!g_editHandle->call_edit_section_param(&ctx, CollectSelectedRange)) return false;
+    if (!ctx.valid) return false;
+
+    g_cachedOutputRangeStart = ctx.frameStart;
+    g_cachedOutputRangeEnd = ctx.frameEnd;
     g_cachedOutputRangeValid = true;
     return true;
 }
@@ -1734,7 +1869,14 @@ void StartSnipping() {
 void OpenImageFileExplorer(HWND parent) { wchar_t sz[MAX_PATH] = {0}; OPENFILENAMEW of = {0}; of.lStructSize = sizeof(of); of.hwndOwner = parent; of.lpstrFile = sz; of.nMaxFile = sizeof(sz); of.lpstrFilter = L"Image Files\0*.png;*.gif;*.jpg;*.jpeg;*.bmp\0All Files\0*.*\0"; of.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST; if (GetOpenFileNameW(&of)) { g_tempImgPath = sz; g_isImageRemoved = false; UpdateAddPreviewImage(); } }
 
 static bool TriggerGifExportShortcut() {
-    HWND hostWnd = g_hwnd ? GetAncestor(g_hwnd, GA_ROOT) : nullptr;
+    HWND hostWnd = ResolveHostWindow(g_hDlg ? g_hDlg : g_hwnd);
+    {
+        std::ostringstream os;
+        os << "TriggerGifExportShortcut: g_hwnd=" << (void*)g_hwnd
+           << " visible=" << (g_hwnd && IsWindowVisible(g_hwnd) ? 1 : 0)
+           << " hostWnd=" << (void*)hostWnd;
+        AppendUiDebugLine(os.str());
+    }
     if (hostWnd && IsWindow(hostWnd)) {
         if (IsIconic(hostWnd)) {
             ShowWindow(hostWnd, SW_RESTORE);
@@ -1758,7 +1900,15 @@ static bool TriggerGifExportShortcut() {
 }
 
 static void ActivateHostForSelectionRead(HWND requester) {
-    HWND hostWnd = g_hwnd ? GetAncestor(g_hwnd, GA_ROOT) : nullptr;
+    HWND hostWnd = ResolveHostWindow(requester);
+    {
+        std::ostringstream os;
+        os << "ActivateHostForSelectionRead: requester=" << (void*)requester
+           << " g_hwnd=" << (void*)g_hwnd
+           << " visible=" << (g_hwnd && IsWindowVisible(g_hwnd) ? 1 : 0)
+           << " hostWnd=" << (void*)hostWnd;
+        AppendUiDebugLine(os.str());
+    }
     if (hostWnd && IsWindow(hostWnd)) {
         if (IsIconic(hostWnd)) {
             ShowWindow(hostWnd, SW_RESTORE);
@@ -1921,6 +2071,19 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_addCurrentFrame = (g_addCurrentFrame + 1) % g_addFrameCount;
             RECT rp = {75, TITLE_H+120, 335, TITLE_H+266};
             InvalidateRect(hwnd, &rp, FALSE);
+        } else if (wp == ID_TIMER_HIDE_MAIN_AFTER_EXPORT) {
+            if (g_hideMainAfterExportTicks > 0) {
+                g_hideMainAfterExportTicks--;
+                if (!g_mainWasVisibleBeforeAddDialog && g_hwnd && IsWindow(g_hwnd) && IsWindowVisible(g_hwnd)) {
+                    AppendUiDebugLine("HideMainTimer: force hide g_hwnd");
+                    ShowWindow(g_hwnd, SW_HIDE);
+                }
+            }
+            if (g_hideMainAfterExportTicks <= 0) {
+                g_suppressMainShow = false;
+                AppendUiDebugLine("HideMainTimer: stop watchdog and release suppress");
+                KillTimer(hwnd, ID_TIMER_HIDE_MAIN_AFTER_EXPORT);
+            }
         } else if (wp == ID_TIMER_GIF_HINT_POLL) {
             HWND hGifBtn = GetDlgItem(hwnd, ID_BTN_GIF_EXPORT);
             if (hGifBtn && IsWindow(hGifBtn)) {
@@ -2084,28 +2247,80 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             RefreshAssets(false); 
-            if(g_hwnd) { ShowWindow(g_hwnd, SW_SHOW); SetForegroundWindow(g_hwnd); InvalidateRect(g_hwnd, NULL, FALSE); }
+            if (g_mainWasVisibleBeforeAddDialog && g_hwnd && IsWindow(g_hwnd)) {
+                ShowWindow(g_hwnd, SW_SHOW);
+                SetForegroundWindow(g_hwnd);
+                InvalidateRect(g_hwnd, NULL, FALSE);
+            }
             DestroyWindow(hwnd);
         } else if (LOWORD(wp) == ID_BTN_CANCEL) DestroyWindow(hwnd);
         else if (LOWORD(wp) == ID_BTN_SNIP) StartSnipping();
         else if (LOWORD(wp) == ID_BTN_GIF_EXPORT) {
             if (!ShowGifExportGuideIfNeeded(hwnd)) return 0;
-            if (!CacheRangeFromCurrentAliasData()) {
+            bool mainWasVisible = (g_hwnd && IsWindow(g_hwnd) && IsWindowVisible(g_hwnd));
+            auto restoreMainHidden = [&]() {
+                if (!mainWasVisible && g_hwnd && IsWindow(g_hwnd) && IsWindowVisible(g_hwnd)) {
+                    ShowWindow(g_hwnd, SW_HIDE);
+                }
+            };
+            bool fromCapturedSelection = false;
+            bool fromTimeline = false;
+            bool fromAlias = false;
+
+            if (g_addDialogRangeValid) {
+                g_cachedOutputRangeStart = g_addDialogRangeStart;
+                g_cachedOutputRangeEnd = g_addDialogRangeEnd;
+                g_cachedOutputRangeValid = true;
+                fromCapturedSelection = true;
+            } else {
+                ActivateHostForSelectionRead(hwnd);
+                fromTimeline = CacheRangeFromTimelineSelection();
+            }
+
+            if (!fromCapturedSelection && !fromTimeline) {
+                fromAlias = CacheRangeFromCurrentAliasData();
+            }
+            if (!fromCapturedSelection && !fromTimeline && !fromAlias) {
+                restoreMainHidden();
                 ShowDarkMsg(hwnd, L"書き出し範囲を取得できませんでした。\n先に「MyAsset：追加」で対象オブジェクトを選択してください。", L"Info", MB_OK);
                 return 0;
             }
+            if (g_enableGifRangeDebug) {
+                std::wstring source = L"alias-fallback";
+                if (fromCapturedSelection) source = L"captured-selection";
+                else if (fromTimeline) source = L"timeline-selection";
+                std::wstring msg = L"range-source: " + source +
+                    L"\nrange: " + std::to_wstring(g_cachedOutputRangeStart) + L" ～ " + std::to_wstring(g_cachedOutputRangeEnd) +
+                    L"\nalias-bytes: " + std::to_wstring(g_tempAliasData.size());
+                MessageBoxW(hwnd, msg.c_str(), L"MyAsset GIF Range Debug", MB_OK);
+            }
             ActivateHostForSelectionRead(hwnd);
             if (!ApplyCachedRangeToTimeline()) {
+                restoreMainHidden();
                 ShowWindow(hwnd, SW_SHOW);
                 SetForegroundWindow(hwnd);
                 ShowDarkMsg(hwnd, L"タイムラインの範囲指定に失敗しました。", L"Error", MB_OK);
                 return 0;
             }
+            g_suppressMainShow = true;
+            DumpProcessWindowsForUiDebug("before-trigger");
             if (!TriggerGifExportShortcut()) {
+                g_suppressMainShow = false;
+                restoreMainHidden();
                 ShowWindow(hwnd, SW_SHOW);
                 SetForegroundWindow(hwnd);
                 ShowDarkMsg(hwnd, L"ショートカット送信に失敗しました。", L"Error", MB_OK);
+                return 0;
             }
+            DumpProcessWindowsForUiDebug("after-trigger");
+            if (!mainWasVisible) {
+                g_hideMainAfterExportTicks = 30;
+                SetTimer(hwnd, ID_TIMER_HIDE_MAIN_AFTER_EXPORT, 100, NULL);
+                AppendUiDebugLine("GIF export: start hide-main watchdog timer");
+            } else {
+                g_suppressMainShow = false;
+            }
+            restoreMainHidden();
         }
         return 0;
     }
@@ -2114,6 +2329,8 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SaveWindowPos(hwnd, true); 
         DeleteFileW(GetForcedPreviewOutputPath().c_str());
         KillTimer(hwnd, ID_TIMER_GIF_HINT_POLL);
+        KillTimer(hwnd, ID_TIMER_HIDE_MAIN_AFTER_EXPORT);
+        g_hideMainAfterExportTicks = 0;
         if (g_addGifHintTimerStarted) {
             KillTimer(hwnd, ID_TIMER_GIF_HINT);
             g_addGifHintTimerStarted = false;
@@ -2129,11 +2346,17 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 void OpenAddDialog(const std::string& data, bool isEdit) { 
     if (g_hDlg) { ShowWindow(g_hDlg, SW_SHOW); SetForegroundWindow(g_hDlg); return; } 
+    g_mainWasVisibleBeforeAddDialog = (g_hwnd && IsWindow(g_hwnd) && IsWindowVisible(g_hwnd));
     g_tempAliasData = data; if (!isEdit) g_editOrgPath = L""; g_isImageRemoved = false; g_tempImgPath = L""; 
+    if (isEdit) {
+        g_addDialogRangeValid = false;
+        g_addDialogRangeStart = 0;
+        g_addDialogRangeEnd = 0;
+    }
     LoadWindowConfig(); int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     int x = (g_dlgX == -1) ? (sw - 360) / 2 : g_dlgX; int y = (g_dlgY == -1) ? (sh - 400) / 2 : g_dlgY;
     WNDCLASSW wc = {0}; wc.lpfnWndProc = AddDlgProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAsset_Add"; wc.hbrBackground = g_hBrBg; RegisterClassW(&wc); 
-    g_hDlg = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"MyAsset_Add", L"アセット", WS_POPUP|WS_VISIBLE|WS_THICKFRAME, x, y, 360, 400, g_hwnd, nullptr, g_hInst, nullptr); 
+    g_hDlg = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"MyAsset_Add", L"アセット", WS_POPUP|WS_VISIBLE|WS_THICKFRAME, x, y, 360, 400, nullptr, nullptr, g_hInst, nullptr); 
 }
 
 // ============================================================
@@ -2213,6 +2436,16 @@ static void DrawContent(HDC hdc, int w, int h) {
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_SHOWWINDOW: {
+        std::ostringstream os;
+        os << "WM_SHOWWINDOW: hwnd=" << (void*)hwnd
+           << " show=" << (wp ? 1 : 0)
+           << " status=" << (long long)lp
+           << " visibleNow=" << (IsWindowVisible(hwnd) ? 1 : 0)
+           << " suppress=" << (g_suppressMainShow ? 1 : 0);
+        AppendUiDebugLine(os.str());
+        return DefWindowProc(hwnd, msg, wp, lp);
+    }
     case WM_CREATE: {
         OleInitialize(NULL); GdiplusStartupInput si; GdiplusStartup(&g_gdiplusToken, &si, NULL);
         g_hFontUI = CreateFontW(15,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Yu Gothic UI");
@@ -2553,6 +2786,28 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
     if (!edit || !edit->get_selected_object_num) return; 
     int count = edit->get_selected_object_num(); 
     if (count <= 0) { ShowDarkMsg(NULL, L"オブジェクトを選択してください", L"Info", MB_OK); return; }
+    g_addDialogRangeValid = false;
+    g_addDialogRangeStart = 0;
+    g_addDialogRangeEnd = 0;
+
+    int memStart = INT_MAX;
+    int memEnd = INT_MIN;
+    bool memRangeFound = false;
+    for (int i = 0; i < count; i++) {
+        void* obj = edit->get_selected_object(i);
+        if (!obj) continue;
+        int s = 0, e = 0;
+        if (TryGetObjectFrameRangeFromMemory(obj, s, e)) {
+            memStart = (std::min)(memStart, s);
+            memEnd = (std::max)(memEnd, e);
+            memRangeFound = true;
+        }
+    }
+    if (memRangeFound) {
+        g_addDialogRangeValid = true;
+        g_addDialogRangeStart = memStart;
+        g_addDialogRangeEnd = memEnd;
+    }
     
     std::string bodyData;
     int minLayer = 99999;
@@ -2714,6 +2969,12 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
             } 
         }
     }
+    int parsedStart = 0, parsedEnd = 0;
+    if (!g_addDialogRangeValid && TryParseFrameRangeFromAliasData(bodyData, parsedStart, parsedEnd)) {
+        g_addDialogRangeValid = true;
+        g_addDialogRangeStart = parsedStart;
+        g_addDialogRangeEnd = parsedEnd;
+    }
     OpenAddDialog(bodyData, false);
 }
 
@@ -2739,6 +3000,17 @@ static void EnsureMainWindowVisible(HWND hwnd) {
 }
 
 void OnShowMainWindow(EDIT_SECTION_SAFE* edit) {
+    {
+        std::ostringstream os;
+        os << "OnShowMainWindow called: suppress=" << (g_suppressMainShow ? 1 : 0)
+           << " g_hwnd=" << (void*)g_hwnd
+           << " visible=" << (g_hwnd && IsWindowVisible(g_hwnd) ? 1 : 0);
+        AppendUiDebugLine(os.str());
+    }
+    if (g_suppressMainShow) {
+        AppendUiDebugLine("OnShowMainWindow ignored (suppressed)");
+        return;
+    }
     if (!g_hwnd || !IsWindow(g_hwnd)) {
         CreatePluginWindow();
     }
