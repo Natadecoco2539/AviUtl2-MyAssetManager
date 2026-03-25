@@ -288,7 +288,7 @@ static bool g_enableGroupDebugDump = false;
 static bool g_enableGifRangeDebug = false;
 static bool g_mainWasVisibleBeforeAddDialog = false;
 static bool g_suppressMainShow = false;
-static bool g_enableMainWindowTrace = true;
+static bool g_enableMainWindowTrace = false;
 static int g_hideMainAfterExportTicks = 0;
 static int g_settingsCategory = 0;
 
