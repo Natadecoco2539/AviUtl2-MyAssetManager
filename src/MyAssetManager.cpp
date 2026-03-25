@@ -3481,7 +3481,6 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 MoveFileExW(srcImgPath.c_str(), destImgPath.c_str(), MOVEFILE_REPLACE_EXISTING);
             }
 
-            // テキストスタイル属性は .object に書かず、別ファイルでパス管理
             if (!g_editOrgPath.empty()) {
                 g_textStylePaths.erase(g_editOrgPath);
             }
