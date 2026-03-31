@@ -1,6 +1,6 @@
-﻿// ------------------------------------------------------------
+// ------------------------------------------------------------
 // MyAssetManager.cpp
-// v1.7.1
+// v1.8
 // ------------------------------------------------------------
 
 #define NOMINMAX
@@ -24,6 +24,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <cstdio>
 #include <cmath>
 
 // GDI+ Headers
@@ -64,6 +65,11 @@ using namespace Gdiplus;
 #define ID_EDIT_SEARCH    203
 #define ID_BTN_SNIP       204 
 #define ID_BTN_GIF_EXPORT 205
+#define ID_BTN_PRESET_A   206
+#define ID_BTN_PRESET_B   207
+#define ID_BTN_PRESET_C   208
+#define ID_BTN_CAPTURE_SAVE 209
+#define ID_BTN_CAPTURE_REUSE 210
 
 #define IDM_FAVORITE      300
 #define IDM_EDIT          301
@@ -76,6 +82,7 @@ using namespace Gdiplus;
 #define IDM_SORT_NAME     308
 #define IDM_SORT_FAVORITE 309
 #define IDM_SORT_CATEGORY 310
+#define IDM_SORT_CUSTOM   314
 #define IDM_APPLY_TEXT_STYLE 311
 #define IDM_TEXT_STYLE_COMMIT 312
 #define IDM_TEXT_STYLE_CANCEL 313
@@ -99,6 +106,9 @@ using namespace Gdiplus;
 #define IDC_CHK_HIDE_TEXTSTYLE_IN_LIST 117
 #define IDC_RAD_PREVIEW_PERF_NORMAL 118
 #define IDC_RAD_PREVIEW_PERF_LOW 119
+#define IDC_SLIDER_PREVIEW_ZOOM 120
+#define IDC_EDIT_PREVIEW_ZOOM 121
+#define IDC_CHK_PREVIEW_THUMB_ONLY 122
 #define IDC_ST_THEME_BASE 1400
 #define IDC_EDIT_THEME_BASE 1450
 #define IDC_BTN_PICK_THEME_BASE 1500
@@ -161,7 +171,7 @@ static COLORREF COL_TIP_BORDER = DEF_COL_TIP_BORDER;
 static COLORREF COL_TIP_TEXT   = DEF_COL_TIP_TEXT;
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#define MYASSET_VERSION_W L"1.7.1"
+#define MYASSET_VERSION_W L"1.8"
 static const wchar_t* kGithubReleaseBase = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/releases/tag/v";
 static const wchar_t* kGithubBugReportUrl = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/issues/new/choose";
 
@@ -267,6 +277,7 @@ static HWND g_hInfoWnd = nullptr;
 static HWND g_hCombo = nullptr;
 static HWND g_hSearch = nullptr;
 static HWND g_hTooltip = nullptr; 
+static HWND g_hostMainWnd = nullptr;
 
 static ULONG_PTR g_gdiplusToken;
 
@@ -281,12 +292,15 @@ static std::wstring g_currentCategory = L"ALL", g_searchQuery = L"";
 static std::set<std::wstring> g_favPaths; 
 static std::set<std::wstring> g_fixedPaths; 
 static std::set<std::wstring> g_textStylePaths;
+static std::map<std::wstring, std::vector<std::wstring>> g_customOrderByCategory;
 static int g_sortMode = 0;
 static int g_gifSpeedPercent = 100;
 static bool g_showGifExportGuide = true;
 static bool g_gifExportKeepOriginal = false;
 static int g_previewPlaybackMode = 1;
 static int g_previewPerfMode = 0;
+static int g_previewZoomPercent = 100;
+static bool g_previewThumbOnly = false;
 static ULONGLONG g_previewAllLastTick = 0;
 static ULONGLONG g_previewHoverLastTick = 0;
 static bool g_enableTextStyle = true;
@@ -299,6 +313,7 @@ static bool g_suppressMainShow = false;
 static bool g_enableMainWindowTrace = false;
 static int g_hideMainAfterExportTicks = 0;
 static int g_settingsCategory = 0;
+static bool g_addDialogFromMyAssetAdd = false;
 
 static int g_winX = 100, g_winY = 100, g_winW = 360, g_winH = 550;
 static int g_dlgX = -1, g_dlgY = -1;
@@ -307,14 +322,44 @@ static int g_scrollY = 0, g_selectedIndex = -1, g_contextTargetIndex = -1, g_hov
 static std::string g_tempAliasData; 
 static std::wstring g_editOrgPath, g_editName, g_editCat, g_tempImgPath, g_msgTitle, g_msgText;
 static bool g_isDragCheck = false, g_isImageRemoved = false, g_isSnipping = false;
+static bool g_isReorderDrag = false;
+static int g_reorderFromIndex = -1;
+static int g_reorderInsertPos = -1;
 static POINT g_dragStartPt = {0}, g_snipStart = {0}, g_snipEnd = {0};
 static int g_msgResult = 0;
 static int g_guideResult = IDCANCEL;
 static bool g_guideHideNext = false;
 static bool g_isMouseTracking = false;
+static RECT g_capturePresetRects[3] = {};
+static bool g_capturePresetValid[3] = { false, false, false };
+static int g_capturePresetSlot = 0;
+static RECT g_lastCapturedRect = {};
+static bool g_lastCapturedRectValid = false;
 
 static UINT GetPreviewAllTickMs() {
     return (g_previewPerfMode == 1) ? 100u : 40u;
+}
+
+static int ScalePreviewValue(int v) {
+    int pct = (std::max)(50, (std::min)(200, g_previewZoomPercent));
+    return (v * pct + 50) / 100;
+}
+
+static int GetListItemHeight() {
+    return g_previewThumbOnly ? ScalePreviewValue(THUMB_H + 14) : ScalePreviewValue(ITEM_HEIGHT);
+}
+
+static int GetListItemMinWidth() {
+    int w = g_previewThumbOnly ? (ScalePreviewValue(THUMB_W) + 14) : ScalePreviewValue(MIN_ITEM_WIDTH);
+    return (std::max)(80, w);
+}
+
+static int GetThumbWScaled() {
+    return (std::max)(16, ScalePreviewValue(THUMB_W));
+}
+
+static int GetThumbHScaled() {
+    return (std::max)(12, ScalePreviewValue(THUMB_H));
 }
 
 static int GetListTopY() { return g_enableTextStyle ? (TITLE_H + TAB_H) : TITLE_H; }
@@ -454,6 +499,8 @@ static std::wstring ColorToHex(COLORREF c);
 static bool TryParseHexColor(const std::wstring& text, COLORREF& out);
 static void RecreateUiBrushes();
 static void ResetThemeColorsToDefault();
+static RECT GetAddPreviewRect();
+static void UpdateAddCapturePresetUi(HWND hwnd);
 
 // ============================================================
 // 1. ユーティリティ & 設定ファイル処理
@@ -485,6 +532,55 @@ static bool TryParseHexColor(const std::wstring& text, COLORREF& out) {
     return true;
 }
 
+static std::wstring CaptureRectToConfigText(const RECT& rc) {
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+    return std::to_wstring(rc.left) + L"," + std::to_wstring(rc.top) + L"," + std::to_wstring(w) + L"," + std::to_wstring(h);
+}
+
+static bool ParseCaptureRectText(const std::wstring& text, RECT& outRc) {
+    int x = 0, y = 0, w = 0, h = 0;
+    if (swscanf_s(text.c_str(), L"%d,%d,%d,%d", &x, &y, &w, &h) != 4) return false;
+    if (w <= 0 || h <= 0) return false;
+    outRc.left = x;
+    outRc.top = y;
+    outRc.right = x + w;
+    outRc.bottom = y + h;
+    return true;
+}
+
+static bool ClampRectToVirtualScreen(const RECT& src, RECT& out) {
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    RECT vr = { vx, vy, vx + vw, vy + vh };
+    RECT rc = src;
+    if (rc.left < vr.left) {
+        int d = vr.left - rc.left;
+        rc.left += d; rc.right += d;
+    }
+    if (rc.top < vr.top) {
+        int d = vr.top - rc.top;
+        rc.top += d; rc.bottom += d;
+    }
+    if (rc.right > vr.right) {
+        int d = rc.right - vr.right;
+        rc.left -= d; rc.right -= d;
+    }
+    if (rc.bottom > vr.bottom) {
+        int d = rc.bottom - vr.bottom;
+        rc.top -= d; rc.bottom -= d;
+    }
+    if (rc.left < vr.left) rc.left = vr.left;
+    if (rc.top < vr.top) rc.top = vr.top;
+    if (rc.right > vr.right) rc.right = vr.right;
+    if (rc.bottom > vr.bottom) rc.bottom = vr.bottom;
+    if (rc.right - rc.left <= 0 || rc.bottom - rc.top <= 0) return false;
+    out = rc;
+    return true;
+}
+
 static void RecreateUiBrushes() {
     if (g_hBrInputBg) { DeleteObject(g_hBrInputBg); g_hBrInputBg = nullptr; }
     if (g_hBrBg) { DeleteObject(g_hBrBg); g_hBrBg = nullptr; }
@@ -506,9 +602,10 @@ static int GetMaxScrollY(HWND hwnd) {
     int viewH = clientH - GetListTopY() - GetBottomReservedHeight();
     if (viewH <= 0) return 0;
 
-    int cols = (std::max)(1, clientW / MIN_ITEM_WIDTH);
+    int itemH = GetListItemHeight();
+    int cols = (std::max)(1, clientW / GetListItemMinWidth());
     int rows = ((int)g_displayAssets.size() + cols - 1) / cols;
-    int contentH = rows * ITEM_HEIGHT;
+    int contentH = rows * itemH;
     if (rows > 0) contentH -= 2;
     return (std::max)(0, contentH - viewH);
 }
@@ -1016,6 +1113,7 @@ static void ApplyTextStyleInheritanceItems(const std::string& originalAlias, std
 struct TextStyleApplyContext {
     std::string styleAlias;
     std::string originalAlias;
+    int appliedCount = 0;
     bool success = false;
     bool hasError = false;
     std::wstring errorMessage;
@@ -1325,6 +1423,11 @@ static std::wstring GetTextStyleFilePath() {
     PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetTextStyle.txt");
     return path;
 }
+static std::wstring GetMetaFilePath() {
+    wchar_t path[MAX_PATH]; GetModuleFileNameW(g_hInst, path, MAX_PATH);
+    PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetMeta.json");
+    return path;
+}
 static std::wstring GetConfigPath() { 
     wchar_t path[MAX_PATH]; GetModuleFileNameW(g_hInst, path, MAX_PATH); 
     PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetConfig.ini"); 
@@ -1409,6 +1512,42 @@ static void DumpProcessWindowsForUiDebug(const char* tag) {
     AppendUiDebugLine(os.str());
 }
 
+struct HostMainFindContext {
+    DWORD pid = 0;
+    HWND found = nullptr;
+};
+
+static BOOL CALLBACK EnumWindowsFindHostMainProc(HWND hwnd, LPARAM lp) {
+    auto* ctx = (HostMainFindContext*)lp;
+    if (!ctx) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != ctx->pid) return TRUE;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+
+    wchar_t clsW[256] = {};
+    GetClassNameW(hwnd, clsW, 255);
+    if (wcsncmp(clsW, L"MyAsset", 7) == 0) return TRUE;
+
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if (!(style & WS_CAPTION)) return TRUE;
+
+    HWND owner = GetWindow(hwnd, GW_OWNER);
+    if (owner && IsWindow(owner)) return TRUE;
+
+    ctx->found = hwnd;
+    return FALSE;
+}
+
+static HWND FindHostMainWindow() {
+    if (g_hostMainWnd && IsWindow(g_hostMainWnd)) return g_hostMainWnd;
+    HostMainFindContext ctx = {};
+    ctx.pid = GetCurrentProcessId();
+    EnumWindows(EnumWindowsFindHostMainProc, (LPARAM)&ctx);
+    g_hostMainWnd = ctx.found;
+    return g_hostMainWnd;
+}
+
 static void AppendGroupDebugText(const std::string& text) {
     HANDLE hFile = CreateFileW(GetGroupDebugPath().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return;
@@ -1431,22 +1570,314 @@ static void InitBaseDir() {
     g_baseDir = path; CreateDirectoryW(g_baseDir.c_str(), nullptr);
 }
 
-void SaveFavorites() { 
-    std::string data; for(const auto& p : g_favPaths) { 
-        int sz = WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, NULL, 0, NULL, NULL);
-        if(sz > 0) { std::vector<char> buf(sz); WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, buf.data(), sz, NULL, NULL); data += buf.data(); data += "\r\n"; }
-    }
-    WriteFileContent(GetFavFilePath(), data);
-}
-void LoadFavorites() { 
-    g_favPaths.clear(); std::string data = ReadFileContent(GetFavFilePath());
-    std::stringstream ss(data); std::string line;
-    while(std::getline(ss, line)) {
-        if(!line.empty() && line.back() == '\r') line.pop_back();
-        if(line.empty()) continue;
+struct AssetMetaFlags {
+    bool favorite = false;
+    bool fixedFrame = false;
+    bool textStyle = false;
+};
+
+static bool g_assetMetaLoaded = false;
+static std::map<std::wstring, AssetMetaFlags> g_assetMetaMap;
+
+static void LoadPathSetFromLegacyFile(const std::wstring& filePath, std::set<std::wstring>& outSet) {
+    outSet.clear();
+    std::string data = ReadFileContent(filePath);
+    std::stringstream ss(data);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
         int sz = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, NULL, 0);
-        if(sz > 0) { std::vector<wchar_t> buf(sz); MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, buf.data(), sz); g_favPaths.insert(std::wstring(buf.data())); }
+        if (sz <= 0) continue;
+        std::vector<wchar_t> buf((size_t)sz);
+        MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, buf.data(), sz);
+        outSet.insert(std::wstring(buf.data()));
     }
+}
+
+static std::string EscapeJsonString(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (unsigned char ch : s) {
+        switch (ch) {
+        case '\"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (ch < 0x20) {
+                char buf[8] = {};
+                sprintf_s(buf, "\\u%04X", (unsigned int)ch);
+                out += buf;
+            } else {
+                out.push_back((char)ch);
+            }
+            break;
+        }
+    }
+    return out;
+}
+
+static void SyncSetsFromMetaMap() {
+    g_favPaths.clear();
+    g_fixedPaths.clear();
+    g_textStylePaths.clear();
+    for (const auto& kv : g_assetMetaMap) {
+        if (kv.second.favorite) g_favPaths.insert(kv.first);
+        if (kv.second.fixedFrame) g_fixedPaths.insert(kv.first);
+        if (kv.second.textStyle) g_textStylePaths.insert(kv.first);
+    }
+}
+
+static void RebuildMetaMapFromSets() {
+    std::map<std::wstring, AssetMetaFlags> nextMap;
+    for (const auto& p : g_favPaths) nextMap[p].favorite = true;
+    for (const auto& p : g_fixedPaths) nextMap[p].fixedFrame = true;
+    for (const auto& p : g_textStylePaths) nextMap[p].textStyle = true;
+    g_assetMetaMap.swap(nextMap);
+}
+
+static std::string BuildMetaJsonText() {
+    RebuildMetaMapFromSets();
+    std::ostringstream os;
+    os << "{\n";
+    os << "  \"version\": 1,\n";
+    os << "  \"assets\": {\n";
+    bool first = true;
+    for (const auto& kv : g_assetMetaMap) {
+        if (!first) os << ",\n";
+        first = false;
+        std::string pathUtf8 = EscapeJsonString(WideToUtf8(kv.first));
+        os << "    \"" << pathUtf8 << "\": {";
+        os << "\"favorite\": " << (kv.second.favorite ? "true" : "false") << ", ";
+        os << "\"fixedFrame\": " << (kv.second.fixedFrame ? "true" : "false") << ", ";
+        os << "\"textStyle\": " << (kv.second.textStyle ? "true" : "false") << "}";
+    }
+    os << "\n";
+    os << "  }\n";
+    os << "}\n";
+    return os.str();
+}
+
+static bool JsonSkipWs(const std::string& s, size_t& i) {
+    while (i < s.size() && isspace((unsigned char)s[i])) ++i;
+    return i < s.size();
+}
+
+static bool JsonParseString(const std::string& s, size_t& i, std::string& out) {
+    out.clear();
+    if (i >= s.size() || s[i] != '\"') return false;
+    ++i;
+    while (i < s.size()) {
+        char c = s[i++];
+        if (c == '\"') return true;
+        if (c == '\\') {
+            if (i >= s.size()) return false;
+            char e = s[i++];
+            switch (e) {
+            case '\"': out.push_back('\"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'u':
+                if (i + 4 > s.size()) return false;
+                out.push_back('?');
+                i += 4;
+                break;
+            default:
+                return false;
+            }
+        } else {
+            out.push_back(c);
+        }
+    }
+    return false;
+}
+
+static bool JsonParseBool(const std::string& s, size_t& i, bool& out) {
+    if (i + 4 <= s.size() && s.compare(i, 4, "true") == 0) { i += 4; out = true; return true; }
+    if (i + 5 <= s.size() && s.compare(i, 5, "false") == 0) { i += 5; out = false; return true; }
+    return false;
+}
+
+static bool JsonSkipValue(const std::string& s, size_t& i);
+
+static bool JsonSkipObject(const std::string& s, size_t& i) {
+    if (i >= s.size() || s[i] != '{') return false;
+    ++i;
+    JsonSkipWs(s, i);
+    if (i < s.size() && s[i] == '}') { ++i; return true; }
+    while (i < s.size()) {
+        std::string key;
+        if (!JsonParseString(s, i, key)) return false;
+        JsonSkipWs(s, i);
+        if (i >= s.size() || s[i] != ':') return false;
+        ++i;
+        JsonSkipWs(s, i);
+        if (!JsonSkipValue(s, i)) return false;
+        JsonSkipWs(s, i);
+        if (i < s.size() && s[i] == ',') { ++i; JsonSkipWs(s, i); continue; }
+        if (i < s.size() && s[i] == '}') { ++i; return true; }
+        return false;
+    }
+    return false;
+}
+
+static bool JsonSkipArray(const std::string& s, size_t& i) {
+    if (i >= s.size() || s[i] != '[') return false;
+    ++i;
+    JsonSkipWs(s, i);
+    if (i < s.size() && s[i] == ']') { ++i; return true; }
+    while (i < s.size()) {
+        if (!JsonSkipValue(s, i)) return false;
+        JsonSkipWs(s, i);
+        if (i < s.size() && s[i] == ',') { ++i; JsonSkipWs(s, i); continue; }
+        if (i < s.size() && s[i] == ']') { ++i; return true; }
+        return false;
+    }
+    return false;
+}
+
+static bool JsonSkipValue(const std::string& s, size_t& i) {
+    JsonSkipWs(s, i);
+    if (i >= s.size()) return false;
+    if (s[i] == '{') return JsonSkipObject(s, i);
+    if (s[i] == '[') return JsonSkipArray(s, i);
+    if (s[i] == '\"') { std::string dummy; return JsonParseString(s, i, dummy); }
+    bool b = false;
+    if (JsonParseBool(s, i, b)) return true;
+    if (i + 4 <= s.size() && s.compare(i, 4, "null") == 0) { i += 4; return true; }
+    size_t begin = i;
+    if (s[i] == '-' || s[i] == '+') ++i;
+    while (i < s.size() && (isdigit((unsigned char)s[i]) || s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '+' || s[i] == '-')) ++i;
+    return i > begin;
+}
+
+static bool ParseAssetFlagsObject(const std::string& s, size_t& i, AssetMetaFlags& flags) {
+    if (i >= s.size() || s[i] != '{') return false;
+    ++i;
+    JsonSkipWs(s, i);
+    if (i < s.size() && s[i] == '}') { ++i; return true; }
+    while (i < s.size()) {
+        std::string key;
+        if (!JsonParseString(s, i, key)) return false;
+        JsonSkipWs(s, i);
+        if (i >= s.size() || s[i] != ':') return false;
+        ++i;
+        JsonSkipWs(s, i);
+        if (key == "favorite") {
+            if (!JsonParseBool(s, i, flags.favorite)) return false;
+        } else if (key == "fixedFrame") {
+            if (!JsonParseBool(s, i, flags.fixedFrame)) return false;
+        } else if (key == "textStyle") {
+            if (!JsonParseBool(s, i, flags.textStyle)) return false;
+        } else {
+            if (!JsonSkipValue(s, i)) return false;
+        }
+        JsonSkipWs(s, i);
+        if (i < s.size() && s[i] == ',') { ++i; JsonSkipWs(s, i); continue; }
+        if (i < s.size() && s[i] == '}') { ++i; return true; }
+        return false;
+    }
+    return false;
+}
+
+static bool ParseMetaAssetsObject(const std::string& s, size_t& i, std::map<std::wstring, AssetMetaFlags>& outMap) {
+    if (i >= s.size() || s[i] != '{') return false;
+    ++i;
+    JsonSkipWs(s, i);
+    if (i < s.size() && s[i] == '}') { ++i; return true; }
+    while (i < s.size()) {
+        std::string pathKey;
+        if (!JsonParseString(s, i, pathKey)) return false;
+        JsonSkipWs(s, i);
+        if (i >= s.size() || s[i] != ':') return false;
+        ++i;
+        JsonSkipWs(s, i);
+        AssetMetaFlags flags = {};
+        if (!ParseAssetFlagsObject(s, i, flags)) return false;
+        std::wstring pathW = Utf8ToWide(pathKey);
+        if (!pathW.empty()) outMap[pathW] = flags;
+        JsonSkipWs(s, i);
+        if (i < s.size() && s[i] == ',') { ++i; JsonSkipWs(s, i); continue; }
+        if (i < s.size() && s[i] == '}') { ++i; return true; }
+        return false;
+    }
+    return false;
+}
+
+static bool ParseMetaJsonText(const std::string& s, std::map<std::wstring, AssetMetaFlags>& outMap) {
+    outMap.clear();
+    size_t i = 0;
+    JsonSkipWs(s, i);
+    if (i >= s.size() || s[i] != '{') return false;
+    ++i;
+    JsonSkipWs(s, i);
+    while (i < s.size() && s[i] != '}') {
+        std::string key;
+        if (!JsonParseString(s, i, key)) return false;
+        JsonSkipWs(s, i);
+        if (i >= s.size() || s[i] != ':') return false;
+        ++i;
+        JsonSkipWs(s, i);
+        if (key == "assets") {
+            if (!ParseMetaAssetsObject(s, i, outMap)) return false;
+        } else {
+            if (!JsonSkipValue(s, i)) return false;
+        }
+        JsonSkipWs(s, i);
+        if (i < s.size() && s[i] == ',') { ++i; JsonSkipWs(s, i); continue; }
+        break;
+    }
+    JsonSkipWs(s, i);
+    return (i < s.size() && s[i] == '}');
+}
+
+static bool SaveAssetMeta() {
+    std::string jsonText = BuildMetaJsonText();
+    WriteFileContent(GetMetaFilePath(), jsonText);
+    return true;
+}
+
+static void LoadLegacyMetaAndMigrate() {
+    LoadPathSetFromLegacyFile(GetFavFilePath(), g_favPaths);
+    LoadPathSetFromLegacyFile(GetFixedFilePath(), g_fixedPaths);
+    LoadPathSetFromLegacyFile(GetTextStyleFilePath(), g_textStylePaths);
+    if (SaveAssetMeta()) {
+        DeleteFileW(GetFavFilePath().c_str());
+        DeleteFileW(GetFixedFilePath().c_str());
+        DeleteFileW(GetTextStyleFilePath().c_str());
+    }
+}
+
+static void LoadAssetMetaUnified(bool forceReload) {
+    if (g_assetMetaLoaded && !forceReload) return;
+    g_assetMetaLoaded = true;
+
+    std::string text = ReadFileContent(GetMetaFilePath());
+    std::map<std::wstring, AssetMetaFlags> parsedMap;
+    if (!text.empty() && ParseMetaJsonText(text, parsedMap)) {
+        g_assetMetaMap.swap(parsedMap);
+        SyncSetsFromMetaMap();
+        return;
+    }
+
+    // JSON がない or 壊れている場合は legacy から移行
+    LoadLegacyMetaAndMigrate();
+}
+
+void SaveFavorites() {
+    SaveAssetMeta();
+}
+void LoadFavorites() {
+    LoadAssetMetaUnified(true);
 }
 static void ToggleFavorite(const std::wstring& path) { 
     if (g_favPaths.count(path)) g_favPaths.erase(path); else g_favPaths.insert(path); 
@@ -1454,21 +1885,10 @@ static void ToggleFavorite(const std::wstring& path) {
 }
 
 void SaveFixedFrames() { 
-    std::string data; for(const auto& p : g_fixedPaths) { 
-        int sz = WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, NULL, 0, NULL, NULL);
-        if(sz > 0) { std::vector<char> buf(sz); WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, buf.data(), sz, NULL, NULL); data += buf.data(); data += "\r\n"; }
-    }
-    WriteFileContent(GetFixedFilePath(), data);
+    SaveAssetMeta();
 }
 void LoadFixedFrames() { 
-    g_fixedPaths.clear(); std::string data = ReadFileContent(GetFixedFilePath());
-    std::stringstream ss(data); std::string line;
-    while(std::getline(ss, line)) {
-        if(!line.empty() && line.back() == '\r') line.pop_back();
-        if(line.empty()) continue;
-        int sz = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, NULL, 0);
-        if(sz > 0) { std::vector<wchar_t> buf(sz); MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, buf.data(), sz); g_fixedPaths.insert(std::wstring(buf.data())); }
-    } 
+    LoadAssetMetaUnified(false);
 } 
 static void ToggleFixedFrame(const std::wstring& path) { 
     if (g_fixedPaths.count(path)) g_fixedPaths.erase(path); else g_fixedPaths.insert(path); 
@@ -1476,21 +1896,10 @@ static void ToggleFixedFrame(const std::wstring& path) {
 }
 
 void SaveTextStyleFlags() {
-    std::string data; for (const auto& p : g_textStylePaths) {
-        int sz = WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, NULL, 0, NULL, NULL);
-        if (sz > 0) { std::vector<char> buf(sz); WideCharToMultiByte(CP_UTF8, 0, p.c_str(), -1, buf.data(), sz, NULL, NULL); data += buf.data(); data += "\r\n"; }
-    }
-    WriteFileContent(GetTextStyleFilePath(), data);
+    SaveAssetMeta();
 }
 void LoadTextStyleFlags() {
-    g_textStylePaths.clear(); std::string data = ReadFileContent(GetTextStyleFilePath());
-    std::stringstream ss(data); std::string line;
-    while (std::getline(ss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-        int sz = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, NULL, 0);
-        if (sz > 0) { std::vector<wchar_t> buf(sz); MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, buf.data(), sz); g_textStylePaths.insert(std::wstring(buf.data())); }
-    }
+    LoadAssetMetaUnified(false);
 }
 
 static void SaveConfig() { 
@@ -1500,6 +1909,16 @@ static void SaveConfig() {
     WritePrivateProfileStringW(L"Settings", L"SortMode", std::to_wstring(g_sortMode).c_str(), GetConfigPath().c_str());
     WritePrivateProfileStringW(L"Settings", L"PreviewPlaybackMode", std::to_wstring(g_previewPlaybackMode).c_str(), GetConfigPath().c_str());
     WritePrivateProfileStringW(L"Settings", L"PreviewPerfMode", std::to_wstring(g_previewPerfMode).c_str(), GetConfigPath().c_str());
+    WritePrivateProfileStringW(L"Settings", L"PreviewZoom", std::to_wstring(g_previewZoomPercent).c_str(), GetConfigPath().c_str());
+    WritePrivateProfileStringW(L"Settings", L"PreviewThumbOnly", g_previewThumbOnly ? L"1" : L"0", GetConfigPath().c_str());
+    WritePrivateProfileStringW(L"Settings", L"CapturePresetSlot", std::to_wstring(g_capturePresetSlot).c_str(), GetConfigPath().c_str());
+    for (int i = 0; i < 3; ++i) {
+        std::wstring keyRect = L"CapturePreset" + std::wstring(1, (wchar_t)(L'A' + i));
+        std::wstring keyValid = keyRect + L"Valid";
+        if (g_capturePresetValid[i]) WritePrivateProfileStringW(L"Settings", keyRect.c_str(), CaptureRectToConfigText(g_capturePresetRects[i]).c_str(), GetConfigPath().c_str());
+        else WritePrivateProfileStringW(L"Settings", keyRect.c_str(), L"", GetConfigPath().c_str());
+        WritePrivateProfileStringW(L"Settings", keyValid.c_str(), g_capturePresetValid[i] ? L"1" : L"0", GetConfigPath().c_str());
+    }
     WritePrivateProfileStringW(L"Settings", L"EnableTextStyle", g_enableTextStyle ? L"1" : L"0", GetConfigPath().c_str());
     unsigned long long inheritMask = 0ULL;
     for (int i = 0; i < kInheritItemCount; ++i) if (g_inheritItemEnabled[i]) inheritMask |= (1ULL << i);
@@ -1517,11 +1936,27 @@ static void LoadConfig() {
     g_showGifExportGuide = (GetPrivateProfileIntW(L"Settings", L"ShowGifExportGuide", 1, GetConfigPath().c_str()) != 0);
     g_gifExportKeepOriginal = (GetPrivateProfileIntW(L"Settings", L"GifExportKeepOriginal", 0, GetConfigPath().c_str()) != 0);
     g_sortMode = GetPrivateProfileIntW(L"Settings", L"SortMode", 0, GetConfigPath().c_str());
-    if (g_sortMode < 0 || g_sortMode > 2) g_sortMode = 0;
+    if (g_sortMode < 0 || g_sortMode > 3) g_sortMode = 0;
     g_previewPlaybackMode = GetPrivateProfileIntW(L"Settings", L"PreviewPlaybackMode", 1, GetConfigPath().c_str());
     if (g_previewPlaybackMode < 0 || g_previewPlaybackMode > 1) g_previewPlaybackMode = 1;
     g_previewPerfMode = GetPrivateProfileIntW(L"Settings", L"PreviewPerfMode", 0, GetConfigPath().c_str());
     if (g_previewPerfMode < 0 || g_previewPerfMode > 1) g_previewPerfMode = 0;
+    g_previewZoomPercent = GetPrivateProfileIntW(L"Settings", L"PreviewZoom", 100, GetConfigPath().c_str());
+    if (g_previewZoomPercent < 50) g_previewZoomPercent = 50;
+    if (g_previewZoomPercent > 200) g_previewZoomPercent = 200;
+    g_previewThumbOnly = (GetPrivateProfileIntW(L"Settings", L"PreviewThumbOnly", 0, GetConfigPath().c_str()) != 0);
+    g_capturePresetSlot = GetPrivateProfileIntW(L"Settings", L"CapturePresetSlot", 0, GetConfigPath().c_str());
+    if (g_capturePresetSlot < 0 || g_capturePresetSlot > 2) g_capturePresetSlot = 0;
+    for (int i = 0; i < 3; ++i) {
+        std::wstring keyRect = L"CapturePreset" + std::wstring(1, (wchar_t)(L'A' + i));
+        std::wstring keyValid = keyRect + L"Valid";
+        g_capturePresetValid[i] = (GetPrivateProfileIntW(L"Settings", keyValid.c_str(), 0, GetConfigPath().c_str()) != 0);
+        wchar_t buf[128] = {};
+        GetPrivateProfileStringW(L"Settings", keyRect.c_str(), L"", buf, 128, GetConfigPath().c_str());
+        RECT rc = {};
+        if (!ParseCaptureRectText(buf, rc)) g_capturePresetValid[i] = false;
+        else g_capturePresetRects[i] = rc;
+    }
     g_enableTextStyle = (GetPrivateProfileIntW(L"Settings", L"EnableTextStyle", 1, GetConfigPath().c_str()) != 0);
     if (!g_enableTextStyle) g_assetViewTab = 0;
     wchar_t maskBuf[64] = {};
@@ -1589,6 +2024,212 @@ static std::wstring GetUniqueFileName(const std::wstring& dir, const std::wstrin
 static std::wstring GetTempPreviewPath(const std::wstring& ext) {
     wchar_t tempPath[MAX_PATH]; GetTempPathW(MAX_PATH, tempPath);
     return std::wstring(tempPath) + L"myasset_temp" + ext;
+}
+
+static std::wstring GetCategoryDirPath(const std::wstring& category) {
+    InitBaseDir();
+    if (_wcsicmp(category.c_str(), L"ALL") == 0) return g_baseDir;
+    std::wstring dir = g_baseDir + L"\\" + category;
+    if (PathFileExistsW(dir.c_str())) return dir;
+    if (_wcsicmp(category.c_str(), L"Main") == 0) return g_baseDir;
+    return dir;
+}
+
+static std::wstring GetCategoryOrderFilePath(const std::wstring& category) {
+    if (_wcsicmp(category.c_str(), L"ALL") == 0) return g_baseDir + L"\\MyAssetOrderAll.json";
+    return GetCategoryDirPath(category) + L"\\MyAssetOrder.json";
+}
+
+static std::wstring GetAssetOrderKey(const std::wstring& category, const std::wstring& assetPath) {
+    if (_wcsicmp(category.c_str(), L"ALL") == 0) {
+        std::wstring prefix = g_baseDir + L"\\";
+        if (assetPath.size() > prefix.size()) {
+            std::wstring head = assetPath.substr(0, prefix.size());
+            if (_wcsicmp(head.c_str(), prefix.c_str()) == 0) {
+                return assetPath.substr(prefix.size());
+            }
+        }
+    }
+    std::wstring base = GetCategoryDirPath(category);
+    std::wstring prefix = base + L"\\";
+    if (assetPath.size() > prefix.size()) {
+        std::wstring head = assetPath.substr(0, prefix.size());
+        if (_wcsicmp(head.c_str(), prefix.c_str()) == 0) {
+            return assetPath.substr(prefix.size());
+        }
+    }
+    size_t p = assetPath.find_last_of(L"\\/");
+    return (p == std::wstring::npos) ? assetPath : assetPath.substr(p + 1);
+}
+
+static bool ParseOrderJson(const std::string& text, std::vector<std::wstring>& outOrder) {
+    outOrder.clear();
+    size_t keyPos = text.find("\"order\"");
+    if (keyPos == std::string::npos) return false;
+    size_t i = text.find('[', keyPos);
+    if (i == std::string::npos) return false;
+    ++i;
+
+    auto skipWs = [&](size_t& p) {
+        while (p < text.size() && isspace((unsigned char)text[p])) ++p;
+    };
+
+    skipWs(i);
+    if (i < text.size() && text[i] == ']') return true;
+
+    while (i < text.size()) {
+        skipWs(i);
+        std::string s;
+        if (!JsonParseString(text, i, s)) return false;
+        std::wstring w = Utf8ToWide(s);
+        if (!w.empty()) outOrder.push_back(w);
+        skipWs(i);
+        if (i < text.size() && text[i] == ',') { ++i; continue; }
+        if (i < text.size() && text[i] == ']') return true;
+        return false;
+    }
+    return false;
+}
+
+static std::string BuildOrderJson(const std::vector<std::wstring>& order) {
+    std::ostringstream os;
+    os << "{\n";
+    os << "  \"version\": 1,\n";
+    os << "  \"order\": [\n";
+    for (size_t i = 0; i < order.size(); ++i) {
+        if (i > 0) os << ",\n";
+        os << "    \"" << EscapeJsonString(WideToUtf8(order[i])) << "\"";
+    }
+    os << "\n";
+    os << "  ]\n";
+    os << "}\n";
+    return os.str();
+}
+
+static bool LoadCustomOrderForCategory(const std::wstring& category, std::vector<std::wstring>& outOrder) {
+    outOrder.clear();
+    std::string text = ReadFileContent(GetCategoryOrderFilePath(category));
+    if (text.empty()) return false;
+    return ParseOrderJson(text, outOrder);
+}
+
+static bool SaveCustomOrderForCategory(const std::wstring& category, const std::vector<std::wstring>& order) {
+    CreateDirectoryW(GetCategoryDirPath(category).c_str(), nullptr);
+    std::wstring finalPath = GetCategoryOrderFilePath(category);
+    std::wstring tempPath = finalPath + L".tmp";
+    std::string json = BuildOrderJson(order);
+    WriteFileContent(tempPath, json);
+    if (!MoveFileExW(tempPath.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tempPath.c_str());
+        WriteFileContent(finalPath, json);
+    }
+    return true;
+}
+
+static void ReconcileCustomOrderForCategory(const std::wstring& category) {
+    if (category.empty()) return;
+
+    std::vector<std::wstring> order;
+    auto itCache = g_customOrderByCategory.find(category);
+    if (itCache != g_customOrderByCategory.end()) {
+        order = itCache->second;
+    } else {
+        LoadCustomOrderForCategory(category, order);
+    }
+
+    std::vector<std::wstring> existing;
+    existing.reserve(g_assets.size());
+    std::set<std::wstring> existingSet;
+    for (const auto& a : g_assets) {
+        if (category != L"ALL" && a.category != category) continue;
+        std::wstring key = GetAssetOrderKey(category, a.path);
+        existing.push_back(key);
+        existingSet.insert(key);
+    }
+
+    std::vector<std::wstring> nextOrder;
+    nextOrder.reserve(existing.size());
+    std::set<std::wstring> used;
+    for (const auto& k : order) {
+        if (existingSet.count(k) == 0) continue;
+        if (used.insert(k).second) nextOrder.push_back(k);
+    }
+    for (const auto& k : existing) {
+        if (used.insert(k).second) nextOrder.push_back(k);
+    }
+
+    bool changed = (nextOrder.size() != order.size());
+    if (!changed) {
+        for (size_t i = 0; i < nextOrder.size(); ++i) {
+            if (nextOrder[i] != order[i]) { changed = true; break; }
+        }
+    }
+
+    g_customOrderByCategory[category] = nextOrder;
+    if (changed) SaveCustomOrderForCategory(category, nextOrder);
+}
+
+static void EnsureCustomOrderReadyForCurrentCategory() {
+    if (g_currentCategory.empty()) return;
+    ReconcileCustomOrderForCategory(g_currentCategory);
+}
+
+static bool CanStartCustomReorder() {
+    if (g_sortMode != 3) return false;
+    if (g_currentCategory.empty()) return false;
+    if (!g_searchQuery.empty()) return false;
+    if (g_enableTextStyle && g_assetViewTab != 0) return false;
+    if (g_hideTextStyleInMainList) return false;
+    return true;
+}
+
+static int GetInsertPosFromPoint(int x, int y, const RECT& rcClient) {
+    int count = (int)g_displayAssets.size();
+    if (count <= 0) return 0;
+    int listTop = GetListTopY();
+    int listBottom = rcClient.bottom - GetBottomReservedHeight();
+    int itemH = GetListItemHeight();
+    int cols = (std::max)(1, (int)rcClient.right / GetListItemMinWidth());
+    int cw = (int)rcClient.right / cols;
+
+    if (y <= listTop) return 0;
+    if (y >= listBottom) return count;
+
+    int row = (y - listTop + g_scrollY) / itemH;
+    if (row < 0) row = 0;
+    int col = x / cw;
+    if (col < 0) col = 0;
+    if (col >= cols) col = cols - 1;
+
+    int idx = row * cols + col;
+    if (idx < 0) idx = 0;
+    if (idx >= count) return count;
+
+    int localX = x - col * cw;
+    bool after = localX >= (cw / 2);
+    int insertPos = idx + (after ? 1 : 0);
+    if (insertPos < 0) insertPos = 0;
+    if (insertPos > count) insertPos = count;
+    return insertPos;
+}
+
+static bool ApplyCustomReorderFromInsertPos() {
+    int count = (int)g_displayAssets.size();
+    if (count <= 1) return false;
+    if (g_reorderFromIndex < 0 || g_reorderFromIndex >= count) return false;
+    if (g_reorderInsertPos < 0 || g_reorderInsertPos > count) return false;
+
+    int dst = g_reorderInsertPos;
+    if (dst > g_reorderFromIndex) dst--;
+    if (dst < 0) dst = 0;
+    if (dst >= count) dst = count - 1;
+    if (dst == g_reorderFromIndex) return false;
+
+    Asset* moving = g_displayAssets[g_reorderFromIndex];
+    g_displayAssets.erase(g_displayAssets.begin() + g_reorderFromIndex);
+    g_displayAssets.insert(g_displayAssets.begin() + dst, moving);
+    g_selectedIndex = dst;
+    return true;
 }
 
 static bool IsGifFile(const std::wstring& path) {
@@ -1729,7 +2370,6 @@ static bool ReplaceObjectAliasByRecreate(EDIT_SECTION_OUT_SAFE* edit, void* targ
     std::string oldAlias;
     if (LPCSTR oldRaw = edit->get_object_alias(targetObj)) oldAlias = oldRaw;
 
-    // 重なりによる自動調整を避けるため、先に旧オブジェクトを削除してから同位置へ再生成
     edit->delete_object(targetObj);
     void* newObj = fnCreate(newAlias.c_str(), lf.layer, lf.start, len);
     if (!newObj) {
@@ -1755,51 +2395,63 @@ static void ApplyTextStyleProc(void* param, EDIT_SECTION_OUT_SAFE* edit) {
         return;
     }
 
-    void* obj = nullptr;
+    std::vector<void*> targets;
     if (edit->get_selected_object_num && edit->get_selected_object) {
         int n = edit->get_selected_object_num();
-        if (n == 1) obj = edit->get_selected_object(0);
+        for (int i = 0; i < n; ++i) {
+            void* obj = edit->get_selected_object(i);
+            if (obj) targets.push_back(obj);
+        }
     }
-    if (!obj && edit->get_focus_object) {
-        obj = edit->get_focus_object();
+    if (targets.empty() && edit->get_focus_object) {
+        void* obj = edit->get_focus_object();
+        if (obj) targets.push_back(obj);
     }
-    if (!obj) {
+    if (targets.empty()) {
         ctx->hasError = true;
-        ctx->errorMessage = L"タイムラインで単体のテキストオブジェクトを選択してください。";
+        ctx->errorMessage = L"タイムラインでテキストオブジェクトを選択してください。";
         return;
     }
 
-    LPCSTR raw = edit->get_object_alias(obj);
-    if (!raw) {
-        ctx->hasError = true;
-        ctx->errorMessage = L"対象オブジェクトのデータ取得に失敗しました。";
-        return;
-    }
+    bool singleTarget = (targets.size() == 1);
+    for (size_t i = 0; i < targets.size(); ++i) {
+        void* obj = targets[i];
+        LPCSTR raw = edit->get_object_alias(obj);
+        if (!raw) {
+            ctx->hasError = true;
+            ctx->errorMessage = L"対象オブジェクトのデータ取得に失敗しました。";
+            return;
+        }
 
-    std::string targetAlias = raw;
-    ctx->originalAlias = targetAlias;
-    if (!IsLikelySingleObjectAlias(targetAlias)) {
-        ctx->hasError = true;
-        ctx->errorMessage = L"対象は単体オブジェクトに限定されています。";
-        return;
-    }
+        std::string targetAlias = raw;
+        if (!IsLikelySingleObjectAlias(targetAlias)) {
+            ctx->hasError = true;
+            ctx->errorMessage = L"対象は単体オブジェクトに限定されています。";
+            return;
+        }
 
-    std::string newAlias;
-    if (!BuildAliasWithAppliedTextStyle(targetAlias, ctx->styleAlias, newAlias)) {
-        ctx->hasError = true;
-        ctx->errorMessage = L"スタイルデータの解析に失敗しました。";
-        return;
-    }
-    ApplyTextStyleInheritanceItems(targetAlias, newAlias);
+        std::string newAlias;
+        if (!BuildAliasWithAppliedTextStyle(targetAlias, ctx->styleAlias, newAlias)) {
+            ctx->hasError = true;
+            ctx->errorMessage = L"スタイルデータの解析に失敗しました。";
+            return;
+        }
+        ApplyTextStyleInheritanceItems(targetAlias, newAlias);
 
-    void* newObj = nullptr;
-    if (!ReplaceObjectAliasByRecreate(edit, obj, newAlias, &newObj) || !newObj) {
-        ctx->hasError = true;
-        ctx->errorMessage = L"スタイル適用に失敗しました。";
-        return;
+        void* newObj = nullptr;
+        if (!ReplaceObjectAliasByRecreate(edit, obj, newAlias, &newObj) || !newObj) {
+            ctx->hasError = true;
+            ctx->errorMessage = L"スタイル適用に失敗しました。";
+            return;
+        }
+
+        ctx->appliedCount++;
+        if (singleTarget && i == 0) {
+            ctx->newObject = newObj;
+            ctx->originalAlias = targetAlias;
+        }
     }
-    ctx->newObject = newObj;
-    ctx->success = true;
+    ctx->success = (ctx->appliedCount > 0);
 }
 
 static void RestorePendingTextStyleProc(void* param, EDIT_SECTION_OUT_SAFE* edit) {
@@ -1831,9 +2483,15 @@ static bool ApplyTextStyleFromAssetPath(HWND owner, const std::wstring& assetPat
         return false;
     }
 
-    g_textStylePending = true;
-    g_textStylePendingObj = ctx.newObject;
-    g_textStyleOriginalAlias = ctx.originalAlias;
+    if (ctx.appliedCount == 1 && ctx.newObject && !ctx.originalAlias.empty()) {
+        g_textStylePending = true;
+        g_textStylePendingObj = ctx.newObject;
+        g_textStyleOriginalAlias = ctx.originalAlias;
+    } else {
+        g_textStylePending = false;
+        g_textStylePendingObj = nullptr;
+        g_textStyleOriginalAlias.clear();
+    }
     return true;
 }
 
@@ -2239,7 +2897,16 @@ static HRESULT CreateFileDropDataObject(const std::wstring& path, IDataObject** 
 // 3. UI 描画補助
 // ============================================================
 static void DrawDarkButton(LPDRAWITEMSTRUCT dis) { 
-    RECT rc = dis->rcItem; HBRUSH br = CreateSolidBrush((dis->itemState & ODS_SELECTED) ? COL_BTN_PUSH : COL_BTN_BG); 
+    RECT rc = dis->rcItem;
+    int id = GetDlgCtrlID(dis->hwndItem);
+    bool isPresetBtn = (id == ID_BTN_PRESET_A || id == ID_BTN_PRESET_B || id == ID_BTN_PRESET_C);
+    bool isPresetActive = false;
+    if (isPresetBtn) {
+        int slot = (id == ID_BTN_PRESET_A) ? 0 : (id == ID_BTN_PRESET_B ? 1 : 2);
+        isPresetActive = (slot == g_capturePresetSlot);
+    }
+    COLORREF bg = (dis->itemState & ODS_SELECTED) ? COL_BTN_PUSH : (isPresetActive ? COL_BTN_ACT : COL_BTN_BG);
+    HBRUSH br = CreateSolidBrush(bg); 
     FillRect(dis->hDC, &rc, br); DeleteObject(br); FrameRect(dis->hDC, &rc, (HBRUSH)GetStockObject(WHITE_BRUSH)); 
     wchar_t buf[256]; GetWindowTextW(dis->hwndItem, buf, 256); SetBkMode(dis->hDC, TRANSPARENT); SetTextColor(dis->hDC, COL_TEXT); SelectObject(dis->hDC, g_hFontUI); 
     DrawTextW(dis->hDC, buf, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE); 
@@ -2438,6 +3105,11 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         ShowWindow(GetDlgItem(hwnd, IDC_RAD_PREVIEW_HOVER), (cat == 1) ? SW_SHOW : SW_HIDE);
         ShowWindow(GetDlgItem(hwnd, IDC_RAD_PREVIEW_PERF_NORMAL), (cat == 1) ? SW_SHOW : SW_HIDE);
         ShowWindow(GetDlgItem(hwnd, IDC_RAD_PREVIEW_PERF_LOW), (cat == 1) ? SW_SHOW : SW_HIDE);
+        ShowWindow(GetDlgItem(hwnd, 10006), (cat == 1) ? SW_SHOW : SW_HIDE);
+        ShowWindow(GetDlgItem(hwnd, 10007), (cat == 1) ? SW_SHOW : SW_HIDE);
+        ShowWindow(GetDlgItem(hwnd, IDC_SLIDER_PREVIEW_ZOOM), (cat == 1) ? SW_SHOW : SW_HIDE);
+        ShowWindow(GetDlgItem(hwnd, IDC_EDIT_PREVIEW_ZOOM), (cat == 1) ? SW_SHOW : SW_HIDE);
+        ShowWindow(GetDlgItem(hwnd, IDC_CHK_PREVIEW_THUMB_ONLY), (cat == 1) ? SW_SHOW : SW_HIDE);
         ShowWindow(GetDlgItem(hwnd, IDC_CHK_GIF_ORIGINAL), (cat == 2) ? SW_SHOW : SW_HIDE);
         ShowWindow(GetDlgItem(hwnd, 10002), (cat == 2) ? SW_SHOW : SW_HIDE);
         for (int i = 0; i < kThemeColorCount; ++i) {
@@ -2471,7 +3143,7 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         SendMessageW(hSide, WM_SETFONT, (WPARAM)g_hFontUI, 0);
         SetWindowTheme(hSide, L"", L"");
         SendMessageW(hSide, LB_ADDSTRING, 0, (LPARAM)L"テキストスタイル");
-        SendMessageW(hSide, LB_ADDSTRING, 0, (LPARAM)L"再生設定");
+        SendMessageW(hSide, LB_ADDSTRING, 0, (LPARAM)L"プレビュー設定");
         SendMessageW(hSide, LB_ADDSTRING, 0, (LPARAM)L"出力設定");
         SendMessageW(hSide, LB_ADDSTRING, 0, (LPARAM)L"外観");
         if (g_settingsCategory < 0 || g_settingsCategory > 3) g_settingsCategory = 0;
@@ -2529,8 +3201,8 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         HWND h3 = CreateWindowW(L"STATIC", L"プレビュー再生", WS_VISIBLE|WS_CHILD, 155, TITLE_H+102, 320, 20, hwnd, (HMENU)10003, g_hInst, NULL); SendMessageW(h3, WM_SETFONT, (WPARAM)g_hFontUI, 0);
         HWND hRadAll = CreateWindowW(L"BUTTON", L"一覧にカーソルがある間は一斉再生", WS_VISIBLE|WS_CHILD|BS_AUTORADIOBUTTON|WS_GROUP, 155, TITLE_H+128, 320, 24, hwnd, (HMENU)IDC_RAD_PREVIEW_ALL, g_hInst, NULL);
         HWND hRadHover = CreateWindowW(L"BUTTON", L"ホバー中のアセットのみ再生", WS_VISIBLE|WS_CHILD|BS_AUTORADIOBUTTON, 155, TITLE_H+154, 320, 24, hwnd, (HMENU)IDC_RAD_PREVIEW_HOVER, g_hInst, NULL);
-        HWND hRadPerfNormal = CreateWindowW(L"BUTTON", L"通常プレビュー (25fps)", WS_VISIBLE|WS_CHILD|BS_AUTORADIOBUTTON|WS_GROUP, 155, TITLE_H+184, 220, 24, hwnd, (HMENU)IDC_RAD_PREVIEW_PERF_NORMAL, g_hInst, NULL);
-        HWND hRadPerfLow = CreateWindowW(L"BUTTON", L"低負荷プレビュー (10fps)", WS_VISIBLE|WS_CHILD|BS_AUTORADIOBUTTON, 155, TITLE_H+208, 220, 24, hwnd, (HMENU)IDC_RAD_PREVIEW_PERF_LOW, g_hInst, NULL);
+        HWND hRadPerfNormal = CreateWindowW(L"BUTTON", L"通常プレビュー (25fps)", WS_VISIBLE|WS_CHILD|BS_AUTORADIOBUTTON|WS_GROUP, 155, TITLE_H+222, 220, 24, hwnd, (HMENU)IDC_RAD_PREVIEW_PERF_NORMAL, g_hInst, NULL);
+        HWND hRadPerfLow = CreateWindowW(L"BUTTON", L"低負荷プレビュー (10fps)", WS_VISIBLE|WS_CHILD|BS_AUTORADIOBUTTON, 155, TITLE_H+246, 220, 24, hwnd, (HMENU)IDC_RAD_PREVIEW_PERF_LOW, g_hInst, NULL);
         SendMessageW(hRadAll, WM_SETFONT, (WPARAM)g_hFontUI, 0);
         SendMessageW(hRadHover, WM_SETFONT, (WPARAM)g_hFontUI, 0);
         SendMessageW(hRadPerfNormal, WM_SETFONT, (WPARAM)g_hFontUI, 0);
@@ -2543,6 +3215,22 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         SendMessageW(hRadHover, BM_SETCHECK, (g_previewPlaybackMode == 0) ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(hRadPerfNormal, BM_SETCHECK, (g_previewPerfMode == 0) ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(hRadPerfLow, BM_SETCHECK, (g_previewPerfMode == 1) ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        HWND hPerfTitle = CreateWindowW(L"STATIC", L"プレビュー負荷", WS_VISIBLE|WS_CHILD, 155, TITLE_H+200, 320, 20, hwnd, (HMENU)10006, g_hInst, NULL);
+        SendMessageW(hPerfTitle, WM_SETFONT, (WPARAM)g_hFontUI, 0);
+        HWND hZoomTitle = CreateWindowW(L"STATIC", L"表示倍率 (50% - 200%)", WS_VISIBLE|WS_CHILD, 155, TITLE_H+286, 320, 20, hwnd, (HMENU)10007, g_hInst, NULL);
+        SendMessageW(hZoomTitle, WM_SETFONT, (WPARAM)g_hFontUI, 0);
+        HWND hZoomSlider = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_VISIBLE|WS_CHILD|TBS_HORZ|TBS_AUTOTICKS, 155, TITLE_H+314, 250, 30, hwnd, (HMENU)IDC_SLIDER_PREVIEW_ZOOM, g_hInst, NULL);
+        SendMessage(hZoomSlider, TBM_SETRANGE, TRUE, MAKELONG(50, 200));
+        SendMessage(hZoomSlider, TBM_SETPOS, TRUE, g_previewZoomPercent);
+        SetWindowTheme(hZoomSlider, L"", L"");
+        HWND hZoomEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", (std::to_wstring(g_previewZoomPercent)).c_str(), WS_VISIBLE|WS_CHILD|ES_NUMBER|ES_CENTER|ES_AUTOHSCROLL, 415, TITLE_H+318, 60, 24, hwnd, (HMENU)IDC_EDIT_PREVIEW_ZOOM, g_hInst, NULL);
+        SendMessageW(hZoomEdit, WM_SETFONT, (WPARAM)g_hFontUI, 0);
+        SetWindowTheme(hZoomEdit, L"", L"");
+        HWND hThumbOnly = CreateWindowW(L"BUTTON", L"サムネイルのみ表示", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 155, TITLE_H+348, 290, 24, hwnd, (HMENU)IDC_CHK_PREVIEW_THUMB_ONLY, g_hInst, NULL);
+        SendMessageW(hThumbOnly, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+        SetWindowTheme(hThumbOnly, L"", L"");
+        SendMessageW(hThumbOnly, BM_SETCHECK, g_previewThumbOnly ? BST_CHECKED : BST_UNCHECKED, 0);
 
         HWND h2 = CreateWindowW(L"STATIC", L"GIF出力解像度", WS_VISIBLE|WS_CHILD, 155, TITLE_H+26, 320, 20, hwnd, (HMENU)10002, g_hInst, NULL); SendMessageW(h2, WM_SETFONT, (WPARAM)g_hFontUI, 0);
         HWND hChk = CreateWindowW(L"BUTTON", L"元解像度で出力（OFF：最大幅480px）", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 155, TITLE_H+56, 320, 24, hwnd, (HMENU)IDC_CHK_GIF_ORIGINAL, g_hInst, NULL);
@@ -2596,17 +3284,29 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     }
     case WM_DRAWITEM: DrawDarkButton((LPDRAWITEMSTRUCT)lp); return TRUE;
     case WM_HSCROLL: { 
-        HWND hSlider = GetDlgItem(hwnd, IDC_SLIDER_SPEED);
-        if ((HWND)lp != hSlider) return 0;
-        g_gifSpeedPercent = (int)SendMessage(hSlider, TBM_GETPOS, 0, 0); 
-        SetDlgItemInt(hwnd, IDC_EDIT_SPEED, g_gifSpeedPercent, FALSE); 
-        SaveConfig();
-        InvalidateRect(hSlider, NULL, FALSE);
+        HWND hSpeedSlider = GetDlgItem(hwnd, IDC_SLIDER_SPEED);
+        HWND hZoomSlider = GetDlgItem(hwnd, IDC_SLIDER_PREVIEW_ZOOM);
+        if ((HWND)lp == hSpeedSlider) {
+            g_gifSpeedPercent = (int)SendMessage(hSpeedSlider, TBM_GETPOS, 0, 0);
+            SetDlgItemInt(hwnd, IDC_EDIT_SPEED, g_gifSpeedPercent, FALSE);
+            SaveConfig();
+            InvalidateRect(hSpeedSlider, NULL, FALSE);
+        } else if ((HWND)lp == hZoomSlider) {
+            g_previewZoomPercent = (int)SendMessage(hZoomSlider, TBM_GETPOS, 0, 0);
+            if (g_previewZoomPercent < 50) g_previewZoomPercent = 50;
+            if (g_previewZoomPercent > 200) g_previewZoomPercent = 200;
+            SetDlgItemInt(hwnd, IDC_EDIT_PREVIEW_ZOOM, g_previewZoomPercent, FALSE);
+            SaveConfig();
+            UpdateDisplayList();
+            InvalidateRect(hZoomSlider, NULL, FALSE);
+        } else {
+            return 0;
+        }
         return 0; 
     }
     case WM_NOTIFY: {
         NMHDR* hdr = (NMHDR*)lp;
-        if (hdr && hdr->idFrom == IDC_SLIDER_SPEED && hdr->code == NM_CUSTOMDRAW) {
+        if (hdr && (hdr->idFrom == IDC_SLIDER_SPEED || hdr->idFrom == IDC_SLIDER_PREVIEW_ZOOM) && hdr->code == NM_CUSTOMDRAW) {
             return DrawSpeedSliderCustom((NMCUSTOMDRAW*)lp);
         }
         return 0;
@@ -2623,9 +3323,26 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                 InvalidateRect(hSlider, NULL, FALSE);
             }
         }
+        else if (LOWORD(wp) == IDC_EDIT_PREVIEW_ZOOM && HIWORD(wp) == EN_CHANGE) {
+            if (GetFocus() == GetDlgItem(hwnd, IDC_EDIT_PREVIEW_ZOOM)) {
+                int val = GetDlgItemInt(hwnd, IDC_EDIT_PREVIEW_ZOOM, NULL, FALSE);
+                if (val < 50) val = 50; if (val > 200) val = 200;
+                g_previewZoomPercent = val;
+                HWND hSlider = GetDlgItem(hwnd, IDC_SLIDER_PREVIEW_ZOOM);
+                SendMessage(hSlider, TBM_SETPOS, TRUE, val);
+                SaveConfig();
+                UpdateDisplayList();
+                InvalidateRect(hSlider, NULL, FALSE);
+            }
+        }
         else if (LOWORD(wp) == IDC_CHK_GIF_ORIGINAL && HIWORD(wp) == BN_CLICKED) {
             g_gifExportKeepOriginal = (SendMessageW(GetDlgItem(hwnd, IDC_CHK_GIF_ORIGINAL), BM_GETCHECK, 0, 0) == BST_CHECKED);
             SaveConfig();
+        }
+        else if (LOWORD(wp) == IDC_CHK_PREVIEW_THUMB_ONLY && HIWORD(wp) == BN_CLICKED) {
+            g_previewThumbOnly = (SendMessageW(GetDlgItem(hwnd, IDC_CHK_PREVIEW_THUMB_ONLY), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveConfig();
+            UpdateDisplayList();
         }
         else if (LOWORD(wp) == IDC_CHK_ENABLE_TEXT_STYLE && HIWORD(wp) == BN_CLICKED) {
             g_enableTextStyle = (SendMessageW(GetDlgItem(hwnd, IDC_CHK_ENABLE_TEXT_STYLE), BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -2781,6 +3498,9 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         SendMessageW(GetDlgItem(hwnd, IDC_RAD_PREVIEW_HOVER), BM_SETCHECK, g_previewPlaybackMode == 0 ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(GetDlgItem(hwnd, IDC_RAD_PREVIEW_PERF_NORMAL), BM_SETCHECK, g_previewPerfMode == 0 ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(GetDlgItem(hwnd, IDC_RAD_PREVIEW_PERF_LOW), BM_SETCHECK, g_previewPerfMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(GetDlgItem(hwnd, IDC_SLIDER_PREVIEW_ZOOM), TBM_SETPOS, TRUE, g_previewZoomPercent);
+        SetDlgItemInt(hwnd, IDC_EDIT_PREVIEW_ZOOM, g_previewZoomPercent, FALSE);
+        SendMessageW(GetDlgItem(hwnd, IDC_CHK_PREVIEW_THUMB_ONLY), BM_SETCHECK, g_previewThumbOnly ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(GetDlgItem(hwnd, IDC_CHK_CLEAR_EFFECTS_FROM2), BM_SETCHECK, g_textStyleClearEffectsFrom2 ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(GetDlgItem(hwnd, IDC_CHK_HIDE_TEXTSTYLE_IN_LIST), BM_SETCHECK, g_hideTextStyleInMainList ? BST_CHECKED : BST_UNCHECKED, 0);
         for (int i = 0; i < kThemeColorCount; ++i) {
@@ -3073,14 +3793,35 @@ void UpdateDisplayList() {
         if (g_enableTextStyle && g_assetViewTab == 0 && g_hideTextStyleInMainList && a.isTextStyle) continue;
         if ((g_currentCategory == L"ALL" || a.category == g_currentCategory) && (sl.empty() || ToLower(a.name).find(sl) != std::wstring::npos)) 
             g_displayAssets.push_back(&a); 
-    } 
-    std::sort(g_displayAssets.begin(), g_displayAssets.end(), [](Asset* a, Asset* b) {
+    }
+
+    std::map<std::wstring, int> customRank;
+    if (g_sortMode == 3) {
+        EnsureCustomOrderReadyForCurrentCategory();
+        auto it = g_customOrderByCategory.find(g_currentCategory);
+        if (it != g_customOrderByCategory.end()) {
+            for (int i = 0; i < (int)it->second.size(); ++i) customRank[it->second[(size_t)i]] = i;
+        }
+    }
+
+    std::sort(g_displayAssets.begin(), g_displayAssets.end(), [&customRank](Asset* a, Asset* b) {
         if (g_sortMode == 1) {
             if (a->isFavorite != b->isFavorite) return a->isFavorite > b->isFavorite;
             return a->name < b->name;
         }
         if (g_sortMode == 2) {
             if (a->category != b->category) return a->category < b->category;
+            return a->name < b->name;
+        }
+        if (g_sortMode == 3) {
+            std::wstring ka = GetAssetOrderKey(g_currentCategory, a->path);
+            std::wstring kb = GetAssetOrderKey(g_currentCategory, b->path);
+            int ra = INT_MAX, rb = INT_MAX;
+            auto ia = customRank.find(ka);
+            if (ia != customRank.end()) ra = ia->second;
+            auto ib = customRank.find(kb);
+            if (ib != customRank.end()) rb = ib->second;
+            if (ra != rb) return ra < rb;
             return a->name < b->name;
         }
         return a->name < b->name;
@@ -3090,16 +3831,49 @@ void UpdateDisplayList() {
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
 }
+
+static void SaveCurrentDisplayOrderForCategory() {
+    if (g_currentCategory.empty()) return;
+    std::vector<std::wstring> order;
+    order.reserve(g_displayAssets.size());
+    for (auto* a : g_displayAssets) {
+        if (!a) continue;
+        if (g_currentCategory != L"ALL" && a->category != g_currentCategory) continue;
+        order.push_back(GetAssetOrderKey(g_currentCategory, a->path));
+    }
+    g_customOrderByCategory[g_currentCategory] = order;
+    SaveCustomOrderForCategory(g_currentCategory, order);
+}
+
 void RefreshAssets(bool reloadFav) { 
+    std::wstring prevCategory = g_currentCategory;
     InitBaseDir(); if (reloadFav) LoadFavorites(); 
     LoadFixedFrames(); 
     LoadTextStyleFlags();
     LoadConfig(); 
     if (!g_lastTempPath.empty()) { DeleteFileW(g_lastTempPath.c_str()); g_lastTempPath = L""; }
+    g_customOrderByCategory.clear();
     ClearAssets(); ScanDirectory(g_baseDir, L"Main"); 
     g_categories.clear(); std::set<std::wstring> cs; for(auto& a : g_assets) cs.insert(a.category);
-    if(g_hCombo) { SendMessage(g_hCombo, CB_RESETCONTENT, 0, 0); SendMessage(g_hCombo, CB_ADDSTRING, 0, (LPARAM)L"すべて (ALL)"); g_categories.push_back(L"ALL"); for(auto& c : cs) { SendMessage(g_hCombo, CB_ADDSTRING, 0, (LPARAM)c.c_str()); g_categories.push_back(c); } SendMessage(g_hCombo, CB_SETCURSEL, 0, 0); }
-    g_currentCategory = L"ALL"; UpdateDisplayList(); 
+    ReconcileCustomOrderForCategory(L"ALL");
+    for (const auto& c : cs) ReconcileCustomOrderForCategory(c);
+    g_categories.push_back(L"ALL");
+    for(auto& c : cs) g_categories.push_back(c);
+
+    if (std::find(g_categories.begin(), g_categories.end(), prevCategory) != g_categories.end()) g_currentCategory = prevCategory;
+    else g_currentCategory = L"ALL";
+
+    if(g_hCombo) {
+        SendMessage(g_hCombo, CB_RESETCONTENT, 0, 0);
+        SendMessage(g_hCombo, CB_ADDSTRING, 0, (LPARAM)L"すべて (ALL)");
+        for(auto& c : cs) SendMessage(g_hCombo, CB_ADDSTRING, 0, (LPARAM)c.c_str());
+        int selIndex = 0;
+        for (int i = 0; i < (int)g_categories.size(); ++i) {
+            if (g_categories[i] == g_currentCategory) { selIndex = i; break; }
+        }
+        SendMessage(g_hCombo, CB_SETCURSEL, selIndex, 0);
+    }
+    UpdateDisplayList(); 
 }
 
 // ============================================================
@@ -3192,9 +3966,11 @@ static LRESULT CALLBACK SnipWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT rc; rc.left = (std::min)(g_snipStart.x, g_snipEnd.x); rc.top = (std::min)(g_snipStart.y, g_snipEnd.y); rc.right = (std::max)(g_snipStart.x, g_snipEnd.x); rc.bottom = (std::max)(g_snipStart.y, g_snipEnd.y);
             POINT ptL = {rc.left, rc.top}, ptR = {rc.right, rc.bottom}; ClientToScreen(hwnd, &ptL); ClientToScreen(hwnd, &ptR); rc.left = ptL.x; rc.top = ptL.y; rc.right = ptR.x; rc.bottom = ptR.y;
             g_tempImgPath = GetTempPreviewPath(L".png"); CaptureRect(rc, g_tempImgPath); DestroyWindow(hwnd);
+            g_lastCapturedRect = rc;
+            g_lastCapturedRectValid = true;
             g_isImageRemoved = false; UpdateAddPreviewImage(); 
             if (g_hwnd) ShowWindow(g_hwnd, SW_SHOW);
-            if (g_hDlg) { ShowWindow(g_hDlg, SW_SHOW); SetForegroundWindow(g_hDlg); }
+            if (g_hDlg) { ShowWindow(g_hDlg, SW_SHOW); SetForegroundWindow(g_hDlg); UpdateAddCapturePresetUi(g_hDlg); }
         } return 0;
     case WM_PAINT: { PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); if (g_isSnipping) { RECT rc = {(std::min)(g_snipStart.x, g_snipEnd.x), (std::min)(g_snipStart.y, g_snipEnd.y), (std::max)(g_snipStart.x, g_snipEnd.x), (std::max)(g_snipStart.y, g_snipEnd.y)}; HBRUSH br = CreateSolidBrush(RGB(255, 0, 0)); FrameRect(hdc, &rc, br); DeleteObject(br); } EndPaint(hwnd, &ps); return 0; }
     case WM_ERASEBKGND: return 1;
@@ -3210,6 +3986,42 @@ void StartSnipping() {
 }
 
 void OpenImageFileExplorer(HWND parent) { wchar_t sz[MAX_PATH] = {0}; OPENFILENAMEW of = {0}; of.lStructSize = sizeof(of); of.hwndOwner = parent; of.lpstrFile = sz; of.nMaxFile = sizeof(sz); of.lpstrFilter = L"Image Files\0*.png;*.gif;*.jpg;*.jpeg;*.bmp\0All Files\0*.*\0"; of.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST; if (GetOpenFileNameW(&of)) { g_tempImgPath = sz; g_isImageRemoved = false; UpdateAddPreviewImage(); } }
+
+static RECT GetAddPreviewRect() {
+    RECT rp = { 75, TITLE_H + 204, 335, TITLE_H + 350 };
+    return rp;
+}
+
+static void UpdateAddCapturePresetUi(HWND hwnd) {
+    if (!hwnd) return;
+    InvalidateRect(GetDlgItem(hwnd, ID_BTN_PRESET_A), NULL, FALSE);
+    InvalidateRect(GetDlgItem(hwnd, ID_BTN_PRESET_B), NULL, FALSE);
+    InvalidateRect(GetDlgItem(hwnd, ID_BTN_PRESET_C), NULL, FALSE);
+    HWND hSave = GetDlgItem(hwnd, ID_BTN_CAPTURE_SAVE);
+    if (hSave) EnableWindow(hSave, g_lastCapturedRectValid ? TRUE : FALSE);
+    HWND hReuse = GetDlgItem(hwnd, ID_BTN_CAPTURE_REUSE);
+    if (hReuse) EnableWindow(hReuse, g_capturePresetValid[g_capturePresetSlot] ? TRUE : FALSE);
+}
+
+static bool CaptureUsingPresetSlot(HWND owner) {
+    if (g_capturePresetSlot < 0 || g_capturePresetSlot > 2) return false;
+    if (!g_capturePresetValid[g_capturePresetSlot]) {
+        if (owner) ShowDarkMsg(owner, L"選択中スロットに保存済み範囲がありません。", L"Info", MB_OK);
+        return false;
+    }
+    RECT rc = {};
+    if (!ClampRectToVirtualScreen(g_capturePresetRects[g_capturePresetSlot], rc)) {
+        if (owner) ShowDarkMsg(owner, L"保存範囲が画面外のため再利用できません。", L"Info", MB_OK);
+        return false;
+    }
+    g_tempImgPath = GetTempPreviewPath(L".png");
+    CaptureRect(rc, g_tempImgPath);
+    g_lastCapturedRect = rc;
+    g_lastCapturedRectValid = true;
+    g_isImageRemoved = false;
+    UpdateAddPreviewImage();
+    return true;
+}
 
 static bool TriggerGifExportShortcut() {
     HWND hostWnd = ResolveHostWindow(g_hDlg ? g_hDlg : g_hwnd);
@@ -3402,23 +4214,44 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HWND hc = CreateWindowW(L"COMBOBOX", L"User", WS_VISIBLE|WS_CHILD|WS_VSCROLL|CBS_DROPDOWN, 75, TITLE_H+47, 260, 200, hwnd, (HMENU)IDC_COMBO_CAT, g_hInst, NULL); SendMessageW(hc, WM_SETFONT, (WPARAM)g_hFontUI, 0);
         HWND hcat = CreateWindowW(L"STATIC", L"カテゴリ:", WS_VISIBLE|WS_CHILD, 15, TITLE_H+50, 60, 20, hwnd, NULL, g_hInst, NULL); SendMessageW(hcat, WM_SETFONT, (WPARAM)g_hFontUI, 0);
         for(const auto& c : g_categories) if(c != L"ALL") SendMessage(hc, CB_ADDSTRING, 0, (LPARAM)c.c_str());
-        CreateWindowW(L"BUTTON", L"キャプチャ", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 75, TITLE_H+80, 100, 26, hwnd, (HMENU)ID_BTN_SNIP, g_hInst, NULL);
-        CreateWindowW(L"BUTTON", L"GIF生成", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 190, TITLE_H+80, 100, 26, hwnd, (HMENU)ID_BTN_GIF_EXPORT, g_hInst, NULL);
+        HWND hCapTitle = CreateWindowW(L"STATIC", L"キャプチャ", WS_VISIBLE|WS_CHILD, 75, TITLE_H+78, 120, 18, hwnd, NULL, g_hInst, NULL);
+        SendMessageW(hCapTitle, WM_SETFONT, (WPARAM)g_hFontUI, 0);
+        CreateWindowW(L"BUTTON", L"キャプチャ", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 75, TITLE_H+96, 100, 24, hwnd, (HMENU)ID_BTN_SNIP, g_hInst, NULL);
+        CreateWindowW(L"BUTTON", L"A", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 190, TITLE_H+96, 30, 24, hwnd, (HMENU)ID_BTN_PRESET_A, g_hInst, NULL);
+        CreateWindowW(L"BUTTON", L"B", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 225, TITLE_H+96, 30, 24, hwnd, (HMENU)ID_BTN_PRESET_B, g_hInst, NULL);
+        CreateWindowW(L"BUTTON", L"C", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 260, TITLE_H+96, 30, 24, hwnd, (HMENU)ID_BTN_PRESET_C, g_hInst, NULL);
+        CreateWindowW(L"BUTTON", L"範囲を保存", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 75, TITLE_H+124, 100, 24, hwnd, (HMENU)ID_BTN_CAPTURE_SAVE, g_hInst, NULL);
+        CreateWindowW(L"BUTTON", L"範囲を再利用", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 190, TITLE_H+124, 100, 24, hwnd, (HMENU)ID_BTN_CAPTURE_REUSE, g_hInst, NULL);
+        HWND hGifTitle = CreateWindowW(L"STATIC", L"GIF", WS_VISIBLE|WS_CHILD, 75, TITLE_H+152, 120, 18, hwnd, NULL, g_hInst, NULL);
+        SendMessageW(hGifTitle, WM_SETFONT, (WPARAM)g_hFontUI, 0);
+        CreateWindowW(L"BUTTON", L"GIF生成", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 75, TITLE_H+170, 100, 24, hwnd, (HMENU)ID_BTN_GIF_EXPORT, g_hInst, NULL);
         if (g_enableTextStyle) {
-            HWND hTs = CreateWindowW(L"BUTTON", L"テキストスタイルとして扱う", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 75, TITLE_H+274, 220, 24, hwnd, (HMENU)IDC_CHK_TEXT_STYLE, g_hInst, NULL);
+            HWND hTs = CreateWindowW(L"BUTTON", L"テキストスタイルとして扱う", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 75, TITLE_H+358, 220, 24, hwnd, (HMENU)IDC_CHK_TEXT_STYLE, g_hInst, NULL);
             SendMessageW(hTs, WM_SETFONT, (WPARAM)g_hFontUI, 0);
             SetWindowTheme(hTs, L"", L"");
             SendMessageW(hTs, BM_SETCHECK, g_addAsTextStyle ? BST_CHECKED : BST_UNCHECKED, 0);
         }
-        CreateWindowW(L"BUTTON", L"保存", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 75, 340, 100, 30, hwnd, (HMENU)ID_BTN_SAVE, g_hInst, NULL);
-        CreateWindowW(L"BUTTON", L"キャンセル", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 190, 340, 100, 30, hwnd, (HMENU)ID_BTN_CANCEL, g_hInst, NULL);
-        if (!g_editOrgPath.empty()) { SetDlgItemTextW(hwnd, IDC_EDIT_NAME, g_editName.c_str()); SetDlgItemTextW(hwnd, IDC_COMBO_CAT, g_editCat.c_str()); }
+        CreateWindowW(L"BUTTON", L"保存", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 75, 428, 100, 30, hwnd, (HMENU)ID_BTN_SAVE, g_hInst, NULL);
+        CreateWindowW(L"BUTTON", L"キャンセル", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 190, 428, 100, 30, hwnd, (HMENU)ID_BTN_CANCEL, g_hInst, NULL);
+        if (!g_editOrgPath.empty()) {
+            SetDlgItemTextW(hwnd, IDC_EDIT_NAME, g_editName.c_str());
+            SetDlgItemTextW(hwnd, IDC_COMBO_CAT, g_editCat.c_str());
+        } else if (g_addDialogFromMyAssetAdd) {
+            if (!g_currentCategory.empty() && g_currentCategory != L"ALL") {
+                LRESULT catIdx = SendMessageW(hc, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)g_currentCategory.c_str());
+                if (catIdx != CB_ERR) {
+                    SendMessageW(hc, CB_SETCURSEL, (WPARAM)catIdx, 0);
+                }
+            }
+            SetFocus(GetDlgItem(hwnd, IDC_EDIT_NAME));
+        }
+        UpdateAddCapturePresetUi(hwnd);
         UpdateAddPreviewImage(); return 0;
     }
     case WM_TIMER:
         if (wp == ID_TIMER_ADD_PREVIEW && g_pAddPreviewImage && g_addFrameCount > 1) {
             g_addCurrentFrame = (g_addCurrentFrame + 1) % g_addFrameCount;
-            RECT rp = {75, TITLE_H+120, 335, TITLE_H+266};
+            RECT rp = GetAddPreviewRect();
             InvalidateRect(hwnd, &rp, FALSE);
         } else if (wp == ID_TIMER_HIDE_MAIN_AFTER_EXPORT) {
             if (g_hideMainAfterExportTicks > 0) {
@@ -3473,7 +4306,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); RECT rc; GetClientRect(hwnd, &rc); FillRect(hdc, &rc, g_hBrBg); DrawTitleBar(hdc, rc.right, L"アセット編集"); DrawWindowBorder(hwnd);
-        Graphics graphics(hdc); RECT rp = {75, TITLE_H+120, 335, TITLE_H+266}; HBRUSH brP = CreateSolidBrush(RGB(20, 20, 20)); FillRect(hdc, &rp, brP); DeleteObject(brP);
+        Graphics graphics(hdc); RECT rp = GetAddPreviewRect(); HBRUSH brP = CreateSolidBrush(RGB(20, 20, 20)); FillRect(hdc, &rp, brP); DeleteObject(brP);
         
         if (g_pAddPreviewImage) {
             if (g_addFrameCount > 1) { GUID gt = FrameDimensionTime; g_pAddPreviewImage->SelectActiveFrame(&gt, g_addCurrentFrame); } 
@@ -3524,7 +4357,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONUP: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; RECT rc; GetClientRect(hwnd, &rc); 
         if (pt.y < TITLE_H && pt.x > rc.right - 40) { DestroyWindow(hwnd); return 0; }
-        RECT rp = {75, TITLE_H+120, 335, TITLE_H+266};
+        RECT rp = GetAddPreviewRect();
         if (g_pAddPreviewImage) { RECT rx = { rp.right - 24, rp.top, rp.right, rp.top + 24 }; if (PtInRect(&rx, pt)) { g_isImageRemoved = true; g_tempImgPath = L""; UpdateAddPreviewImage(); return 0; } }
         if (PtInRect(&rp, pt)) { wchar_t sz[MAX_PATH] = {0}; OPENFILENAMEW of = {0}; of.lStructSize = sizeof(of); of.hwndOwner = hwnd; of.lpstrFile = sz; of.nMaxFile = sizeof(sz); of.lpstrFilter = L"Image Files\0*.png;*.gif;*.jpg;*.jpeg;*.bmp\0All Files\0*.*\0"; of.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST; if (GetOpenFileNameW(&of)) { g_tempImgPath = sz; g_isImageRemoved = false; UpdateAddPreviewImage(); } }
         return 0;
@@ -3534,6 +4367,29 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLORBTN:
     case WM_CTLCOLORSTATIC: { HDC hdc = (HDC)wp; SetTextColor(hdc, COL_TEXT); SetBkMode(hdc, TRANSPARENT); return (LRESULT)g_hBrBg; }
     case WM_COMMAND: {
+        if (HIWORD(wp) == BN_CLICKED) {
+            int id = LOWORD(wp);
+            if (id == ID_BTN_PRESET_A || id == ID_BTN_PRESET_B || id == ID_BTN_PRESET_C) {
+                g_capturePresetSlot = (id == ID_BTN_PRESET_A) ? 0 : (id == ID_BTN_PRESET_B ? 1 : 2);
+                SaveConfig();
+                UpdateAddCapturePresetUi(hwnd);
+                return 0;
+            }
+            if (id == ID_BTN_CAPTURE_SAVE) {
+                if (!g_lastCapturedRectValid) return 0;
+                g_capturePresetRects[g_capturePresetSlot] = g_lastCapturedRect;
+                g_capturePresetValid[g_capturePresetSlot] = true;
+                SaveConfig();
+                UpdateAddCapturePresetUi(hwnd);
+                return 0;
+            }
+            if (id == ID_BTN_CAPTURE_REUSE) {
+                if (CaptureUsingPresetSlot(hwnd)) {
+                    UpdateAddCapturePresetUi(hwnd);
+                }
+                return 0;
+            }
+        }
         if (LOWORD(wp) == IDC_CHK_TEXT_STYLE && HIWORD(wp) == BN_CLICKED) {
             if (!g_enableTextStyle) { g_addAsTextStyle = false; return 0; }
             g_addAsTextStyle = (SendMessageW(GetDlgItem(hwnd, IDC_CHK_TEXT_STYLE), BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -3708,6 +4564,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HideMyTooltip();
         if (g_pAddPreviewImage) { delete g_pAddPreviewImage; g_pAddPreviewImage = nullptr; }
         if (g_pAddPreviewStream) { g_pAddPreviewStream->Release(); g_pAddPreviewStream = nullptr; }
+        g_addDialogFromMyAssetAdd = false;
         g_hDlg = nullptr; return 0;
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
@@ -3715,6 +4572,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 void OpenAddDialog(const std::string& data, bool isEdit) { 
     if (g_hDlg) { ShowWindow(g_hDlg, SW_SHOW); SetForegroundWindow(g_hDlg); return; } 
     g_mainWasVisibleBeforeAddDialog = (g_hwnd && IsWindow(g_hwnd) && IsWindowVisible(g_hwnd));
+    g_lastCapturedRectValid = false;
     g_tempAliasData = data; if (!isEdit) g_editOrgPath = L""; g_isImageRemoved = false; g_tempImgPath = L""; 
     g_addAsTextStyle = false;
     if (isEdit) {
@@ -3724,9 +4582,9 @@ void OpenAddDialog(const std::string& data, bool isEdit) {
         g_addDialogRangeEnd = 0;
     }
     LoadWindowConfig(); int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-    int x = (g_dlgX == -1) ? (sw - 360) / 2 : g_dlgX; int y = (g_dlgY == -1) ? (sh - 400) / 2 : g_dlgY;
+    int x = (g_dlgX == -1) ? (sw - 360) / 2 : g_dlgX; int y = (g_dlgY == -1) ? (sh - 490) / 2 : g_dlgY;
     WNDCLASSW wc = {0}; wc.lpfnWndProc = AddDlgProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAsset_Add"; wc.hbrBackground = g_hBrBg; RegisterClassW(&wc); 
-    g_hDlg = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"MyAsset_Add", L"アセット", WS_POPUP|WS_VISIBLE|WS_THICKFRAME, x, y, 360, 400, nullptr, nullptr, g_hInst, nullptr); 
+    g_hDlg = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"MyAsset_Add", L"アセット", WS_POPUP|WS_VISIBLE|WS_THICKFRAME, x, y, 360, 490, g_hwnd, nullptr, g_hInst, nullptr); 
 }
 
 // ============================================================
@@ -3767,14 +4625,17 @@ static void DrawContent(HDC hdc, int w, int h) {
 
     int listBottom = h - GetBottomReservedHeight();
     int yO = listTop - g_scrollY; HRGN hr = CreateRectRgn(0, listTop, w, listBottom); SelectClipRgn(hdc, hr);
-    Graphics g(hdc); int cols = (std::max)(1, w / MIN_ITEM_WIDTH); int cw = w / cols;
+    int itemH = GetListItemHeight();
+    int thumbW = GetThumbWScaled();
+    int thumbH = GetThumbHScaled();
+    Graphics g(hdc); int cols = (std::max)(1, w / GetListItemMinWidth()); int cw = w / cols;
     
     SetBkMode(hdc, TRANSPARENT);
 
     for (int i = 0; i < (int)g_displayAssets.size(); i++) {
-        int x = (i % cols) * cw, y = (i / cols) * ITEM_HEIGHT + yO;
-        if (y > listBottom || y + ITEM_HEIGHT < listTop) continue;
-        RECT ri = {x + 2, y + 2, x + cw - 2, y + ITEM_HEIGHT - 2}; if (!RectVisible(hdc, &ri)) continue;
+        int x = (i % cols) * cw, y = (i / cols) * itemH + yO;
+        if (y > listBottom || y + itemH < listTop) continue;
+        RECT ri = {x + 2, y + 2, x + cw - 2, y + itemH - 2}; if (!RectVisible(hdc, &ri)) continue;
         
         HBRUSH br = CreateSolidBrush((i == g_selectedIndex) ? COL_ITEM_SEL : COL_ITEM_BG); FillRect(hdc, &ri, br); DeleteObject(br);
         Asset* p = g_displayAssets[i];
@@ -3788,7 +4649,7 @@ static void DrawContent(HDC hdc, int w, int h) {
             // 画像サイズと描画先(サムネ枠)サイズを取得
             UINT iw = p->pImage->GetWidth();
             UINT ih = p->pImage->GetHeight();
-            float thumbRatio = (float)THUMB_W / (float)THUMB_H;
+            float thumbRatio = (float)thumbW / (float)thumbH;
             float imgRatio = (float)iw / (float)ih;
 
             float srcX = 0, srcY = 0, srcW = (float)iw, srcH = (float)ih;
@@ -3801,34 +4662,76 @@ static void DrawContent(HDC hdc, int w, int h) {
                 srcY = (ih - srcH) / 2.0f;
             }
 
+            int imgX = g_previewThumbOnly ? (x + (cw - thumbW) / 2) : (x + 7);
+            int imgY = y + (itemH - thumbH) / 2;
             g.DrawImage(p->pImage, 
-                Rect(x + 7, y + 11, THUMB_W, THUMB_H),
+                Rect(imgX, imgY, thumbW, thumbH),
                 (INT)srcX, (INT)srcY, (INT)srcW, (INT)srcH,
                 UnitPixel);
         }
 
-        if (p->isFavorite) { SetTextColor(hdc, RGB(255, 215, 0)); SelectObject(hdc, g_hFontUI); RECT rs = {ri.right - 25, ri.top + 5, ri.right - 5, ri.top + 25}; DrawTextW(hdc, L"★", -1, &rs, DT_RIGHT); }
+        if (!g_previewThumbOnly && p->isFavorite) { SetTextColor(hdc, RGB(255, 215, 0)); SelectObject(hdc, g_hFontUI); RECT rs = {ri.right - 25, ri.top + 5, ri.right - 5, ri.top + 25}; DrawTextW(hdc, L"★", -1, &rs, DT_RIGHT); }
         
-        g.SetSmoothingMode(SmoothingModeAntiAlias);
-        if (p->isMulti) {
-            RECT rm = {ri.right - 25, ri.bottom - 25, ri.right - 5, ri.bottom - 5};
-            SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontType); 
-            DrawTextW(hdc, L"M", -1, &rm, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        } else {
-            RECT rs = {ri.right - 25, ri.bottom - 25, ri.right - 5, ri.bottom - 5};
-            SetTextColor(hdc, p->isFixedFrame ? COL_FIXED_TEXT : COL_TEXT); 
-            SelectObject(hdc, g_hFontType); 
-            DrawTextW(hdc, L"S", -1, &rs, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-        g.SetSmoothingMode(SmoothingModeDefault);
+        if (!g_previewThumbOnly) {
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            if (p->isMulti) {
+                RECT rm = {ri.right - 25, ri.bottom - 25, ri.right - 5, ri.bottom - 5};
+                SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontType); 
+                DrawTextW(hdc, L"M", -1, &rm, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else {
+                RECT rs = {ri.right - 25, ri.bottom - 25, ri.right - 5, ri.bottom - 5};
+                SetTextColor(hdc, p->isFixedFrame ? COL_FIXED_TEXT : COL_TEXT); 
+                SelectObject(hdc, g_hFontType); 
+                DrawTextW(hdc, L"S", -1, &rs, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            g.SetSmoothingMode(SmoothingModeDefault);
 
-        SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontList); RECT rn = {x + THUMB_W + 15, y + 15, ri.right - 30, y + 45}; DrawTextW(hdc, p->name.c_str(), -1, &rn, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        SetTextColor(hdc, COL_SUBTEXT); SelectObject(hdc, g_hFontListSub); RECT rc = {x + THUMB_W + 15, y + 50, ri.right - 10, ri.bottom - 5}; DrawTextW(hdc, p->category.c_str(), -1, &rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontList); RECT rn = {x + thumbW + 15, y + 15, ri.right - 30, y + 45}; DrawTextW(hdc, p->name.c_str(), -1, &rn, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SetTextColor(hdc, COL_SUBTEXT); SelectObject(hdc, g_hFontListSub); RECT rc = {x + thumbW + 15, y + 50, ri.right - 10, ri.bottom - 5}; DrawTextW(hdc, p->category.c_str(), -1, &rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
 
         
     }
+    if (g_isReorderDrag && g_reorderInsertPos >= 0 && g_reorderInsertPos <= (int)g_displayAssets.size()) {
+        int ins = g_reorderInsertPos;
+        int barX = 2;
+        int barY = listTop + 4 - g_scrollY;
+        int barH = itemH - 8;
+        if (ins < (int)g_displayAssets.size()) {
+            int row = ins / cols;
+            int col = ins % cols;
+            barX = col * cw + 2;
+            barY = row * itemH + listTop - g_scrollY + 4;
+        } else if (!g_displayAssets.empty()) {
+            int last = (int)g_displayAssets.size() - 1;
+            int row = last / cols;
+            int col = last % cols;
+            if (col == cols - 1) {
+                barX = 2;
+                barY = (row + 1) * itemH + listTop - g_scrollY + 4;
+            } else {
+                barX = (col + 1) * cw + 2;
+                barY = row * itemH + listTop - g_scrollY + 4;
+            }
+        }
+        RECT rb = { barX - 2, barY, barX + 2, barY + barH };
+        HBRUSH brIns = CreateSolidBrush(RGB(80, 170, 255));
+        FillRect(hdc, &rb, brIns);
+        DeleteObject(brIns);
+    }
+
     SelectClipRgn(hdc, NULL); DeleteObject(hr);
     drawTopChrome();
+    if (CanStartCustomReorder() && (GetKeyState(VK_CONTROL) & 0x8000)) {
+        RECT rcMode = { w - 220, 4, w - 8, TITLE_H - 4 };
+        HBRUSH brMode = CreateSolidBrush(RGB(50, 90, 180));
+        FillRect(hdc, &rcMode, brMode);
+        DeleteObject(brMode);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(235, 245, 255));
+        SelectObject(hdc, g_hFontUI);
+        DrawTextW(hdc, L"並び替えモード", -1, &rcMode, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
     if (g_enableTextStyle && g_assetViewTab == 1) {
         RECT rcStyle = {0, h - FOOTER_H - STYLE_ACTION_H, w, h - FOOTER_H};
         HBRUSH brStyle = CreateSolidBrush(COL_BG);
@@ -3872,6 +4775,7 @@ static void DrawContent(HDC hdc, int w, int h) {
     const wchar_t* sortLabel = L"名前順";
     if (g_sortMode == 1) sortLabel = L"★優先";
     else if (g_sortMode == 2) sortLabel = L"カテゴリ";
+    else if (g_sortMode == 3) sortLabel = L"カスタム";
     DrawTextW(hdc, sortLabel, -1, &rcFav, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
     DrawWindowBorder(g_hwnd);
@@ -3916,6 +4820,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_NCCALCSIZE: if(wp) return 0; return DefWindowProc(hwnd, msg, wp, lp);
     case WM_NCACTIVATE: return DefWindowProc(hwnd, msg, wp, lp);
     case WM_MOUSEACTIVATE: return MA_ACTIVATE;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
 
     case WM_SIZE: { 
         RECT rc; GetClientRect(hwnd, &rc); int y = rc.bottom - FOOTER_H + 8; 
@@ -3931,6 +4838,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER: 
         
         if (wp == ID_TIMER_HOVER) {
+            bool pausePreviewForReorder = CanStartCustomReorder() && (((GetKeyState(VK_CONTROL) & 0x8000) != 0) || g_isReorderDrag);
+            if (pausePreviewForReorder) {
+                KillTimer(hwnd, ID_TIMER_HOVER);
+                g_previewAllLastTick = 0;
+                g_previewHoverLastTick = 0;
+                return 0;
+            }
             RECT rc = {};
             GetClientRect(hwnd, &rc);
             int listTop = GetListTopY();
@@ -3952,9 +4866,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     double virtualElapsedMs = elapsedMs * speedScale;
 
                     int viewH = listBottom - listTop;
-                    int cols = (std::max)(1, (int)rc.right / MIN_ITEM_WIDTH);
-                    int firstRow = (viewH > 0) ? (g_scrollY / ITEM_HEIGHT) : 0;
-                    int lastRow = (viewH > 0) ? ((g_scrollY + viewH - 1) / ITEM_HEIGHT) : -1;
+                    int itemH = GetListItemHeight();
+                    int cols = (std::max)(1, (int)rc.right / GetListItemMinWidth());
+                    int firstRow = (viewH > 0) ? (g_scrollY / itemH) : 0;
+                    int lastRow = (viewH > 0) ? ((g_scrollY + viewH - 1) / itemH) : -1;
                     int firstIdx = firstRow * cols;
                     int lastIdx = ((lastRow + 1) * cols) - 1;
                     if (firstIdx < 0) firstIdx = 0;
@@ -4092,17 +5007,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 }
 
-                int cols = (std::max)(1, (int)rc.right / MIN_ITEM_WIDTH);
+                int itemH = GetListItemHeight();
+                int cols = (std::max)(1, (int)rc.right / GetListItemMinWidth());
                 int cw = (int)rc.right / cols;
-                int row = (ptClient.y - listTop + g_scrollY) / ITEM_HEIGHT;
+                int row = (ptClient.y - listTop + g_scrollY) / itemH;
                 int col = ptClient.x / cw;
                 int idx = row * cols + col;
                 int itemX = col * cw;
-                int itemY = row * ITEM_HEIGHT + (listTop - g_scrollY);
-                int right = itemX + cw - 2;
-                int bottom = itemY + ITEM_HEIGHT - 2;
-                RECT rcMark = { right - 30, bottom - 30, right, bottom };
-                if (idx != g_tooltipTargetIndex || !PtInRect(&rcMark, ptClient)) {
+                int itemY = row * itemH + (listTop - g_scrollY);
+                bool stillOnTarget = false;
+                if (idx == g_tooltipTargetIndex) {
+                    if (g_previewThumbOnly) {
+                        int thumbW = GetThumbWScaled();
+                        int thumbH = GetThumbHScaled();
+                        RECT rcThumb = {
+                            itemX + (cw - thumbW) / 2,
+                            itemY + (itemH - thumbH) / 2,
+                            itemX + (cw - thumbW) / 2 + thumbW,
+                            itemY + (itemH - thumbH) / 2 + thumbH
+                        };
+                        stillOnTarget = PtInRect(&rcThumb, ptClient) ? true : false;
+                    } else {
+                        int right = itemX + cw - 2;
+                        int bottom = itemY + itemH - 2;
+                        RECT rcMark = { right - 30, bottom - 30, right, bottom };
+                        stillOnTarget = PtInRect(&rcMark, ptClient) ? true : false;
+                    }
+                }
+                if (!stillOnTarget) {
                     g_tooltipTargetIndex = -1;
                     HideMyTooltip();
                     return 0;
@@ -4110,20 +5042,47 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
                 Asset* p = g_displayAssets[g_tooltipTargetIndex];
                 std::wstring mainT, subT;
-                
-                if (p->isMulti) {
-                    mainT = L"複数オブジェクト (Multi Object)";
-                    subT = L"構造を維持するため、保存時の長さで固定されます";
+                if (g_previewThumbOnly) {
+                    mainT = p->name;
+                    std::wstring sm = p->isMulti ? L"M (複数オブジェクト)" : (p->isFixedFrame ? L"S (単体/固定)" : L"S (単体/可変)");
+                    subT = L"カテゴリ: " + p->category + L"\n仕様: " + sm;
                 } else if (p->isFixedFrame) {
-                    mainT = L"単体オブジェクト (Single Object)";
-                    subT = L"保存時のフレーム数を維持して配置します";
+                    if (p->isMulti) {
+                        mainT = L"複数オブジェクト (Multi Object)";
+                        subT = L"構造を維持するため、保存時の長さで固定されます";
+                    } else {
+                        mainT = L"単体オブジェクト (Single Object)";
+                        subT = L"保存時のフレーム数を維持して配置します";
+                    }
                 } else {
-                    mainT = L"単体オブジェクト (Single Object)";
-                    subT = L"現在のレイヤー表示の拡大率によって配置の長さが自動で伸縮します";
+                    if (p->isMulti) {
+                        mainT = L"複数オブジェクト (Multi Object)";
+                        subT = L"構造を維持するため、保存時の長さで固定されます";
+                    } else {
+                        mainT = L"単体オブジェクト (Single Object)";
+                        subT = L"現在のレイヤー表示の拡大率によって配置の長さが自動で伸縮します";
+                    }
                 }
-                
-                POINT pt; GetCursorPos(&pt);
-                ShowMyTooltip(pt.x, pt.y, mainT, subT);
+
+                POINT showPt = {};
+                if (g_previewThumbOnly) {
+                    POINT itemTL = { itemX, itemY };
+                    POINT itemBR = { itemX + cw, itemY + itemH };
+                    ClientToScreen(hwnd, &itemTL);
+                    ClientToScreen(hwnd, &itemBR);
+                    int screenW = GetSystemMetrics(SM_CXSCREEN);
+                    int tooltipApproxW = 240;
+                    if (itemBR.x + tooltipApproxW + 20 <= screenW) {
+                        showPt.x = itemBR.x + 4;
+                    } else {
+                        LONG leftX = itemTL.x - (LONG)tooltipApproxW;
+                        showPt.x = (leftX > 0) ? leftX : 0;
+                    }
+                    showPt.y = itemTL.y;
+                } else {
+                    GetCursorPos(&showPt);
+                }
+                ShowMyTooltip(showPt.x, showPt.y, mainT, subT);
             }
         }
         return 0;
@@ -4132,7 +5091,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
         UINT lines = 3;
         SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
-        int step = (lines == WHEEL_PAGESCROLL) ? (ITEM_HEIGHT * 3) : ((int)lines * SCROLL_SPD);
+        int step = (lines == WHEEL_PAGESCROLL) ? (GetListItemHeight() * 3) : ((int)lines * SCROLL_SPD);
         if (step <= 0) step = SCROLL_SPD;
         SetScrollY(hwnd, g_scrollY - (delta / WHEEL_DELTA) * step);
         return 0;
@@ -4164,6 +5123,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KILLFOCUS:
         ReleaseCapture();
         g_isDragCheck = false;
+        g_isReorderDrag = false;
+        g_reorderFromIndex = -1;
+        g_reorderInsertPos = -1;
         g_hoverIndex = -1;
         KillTimer(hwnd, ID_TIMER_TOOLTIP);
         g_tooltipTargetIndex = -1;
@@ -4173,17 +5135,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CAPTURECHANGED:
         g_isDragCheck = false;
+        g_isReorderDrag = false;
+        g_reorderFromIndex = -1;
+        g_reorderInsertPos = -1;
         return 0;
 
     case WM_RBUTTONDOWN:
     case WM_KEYDOWN:
-        if (g_isDragCheck) {
+    case WM_KEYUP:
+        {
+        bool cancelByInput = (msg == WM_RBUTTONDOWN) || (msg == WM_KEYDOWN && wp == VK_ESCAPE);
+        if (cancelByInput && g_isDragCheck) {
             ReleaseCapture();
             g_isDragCheck = false;
             InvalidateRect(hwnd, NULL, FALSE);
         }
+        if (cancelByInput && g_isReorderDrag) {
+            ReleaseCapture();
+            g_isReorderDrag = false;
+            g_reorderFromIndex = -1;
+            g_reorderInsertPos = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        if ((msg == WM_KEYDOWN || msg == WM_KEYUP) && wp == VK_CONTROL) {
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         if (msg == WM_RBUTTONDOWN) goto RBUTTON_HANDLER; 
         return 0;
+        }
 
     case WM_NCRBUTTONUP:
         if (wp == HTCAPTION) {
@@ -4201,8 +5180,8 @@ RBUTTON_HANDLER:
             ShowSettingsRefreshMenu(hwnd, pt.x, pt.y);
         }
         else if (y > listTop && y < rc.bottom - GetBottomReservedHeight()) {
-            int cols = (std::max)(1, (int)rc.right / MIN_ITEM_WIDTH); int cw = (int)rc.right / cols;
-            int idx = ((y - listTop + g_scrollY) / ITEM_HEIGHT) * cols + (x / cw);
+            int cols = (std::max)(1, (int)rc.right / GetListItemMinWidth()); int cw = (int)rc.right / cols;
+            int idx = ((y - listTop + g_scrollY) / GetListItemHeight()) * cols + (x / cw);
             HMENU hm = CreatePopupMenu();
             if (idx >= 0 && idx < (int)g_displayAssets.size()) { 
                 g_contextTargetIndex = idx; Asset* p = g_displayAssets[idx]; 
@@ -4244,7 +5223,7 @@ RBUTTON_HANDLER:
         else if (id == IDM_INFO_RELEASES) OpenReleaseNotesInBrowser(hwnd);
         else if (id == IDM_INFO_BUGREPORT) OpenBugReportInBrowser(hwnd);
         else if (id == IDM_OPEN_FOLDER) OpenAssetFolderInExplorer(hwnd);
-        else if (id == IDM_EDIT && g_contextTargetIndex != -1) { Asset* p = g_displayAssets[g_contextTargetIndex]; if (p->pImage) { delete p->pImage; p->pImage = nullptr; } g_editOrgPath = p->path; g_editName = p->name; g_editCat = p->category; OpenAddDialog("", true); }
+        else if (id == IDM_EDIT && g_contextTargetIndex != -1) { Asset* p = g_displayAssets[g_contextTargetIndex]; if (p->pImage) { delete p->pImage; p->pImage = nullptr; } g_editOrgPath = p->path; g_editName = p->name; g_editCat = p->category; g_addDialogFromMyAssetAdd = false; OpenAddDialog("", true); }
         else if (id == IDM_FAVORITE && g_contextTargetIndex != -1) { ToggleFavorite(g_displayAssets[g_contextTargetIndex]->path); RefreshAssets(false); }
         else if (id == IDM_APPLY_TEXT_STYLE && g_contextTargetIndex != -1) {
             Asset* p = g_displayAssets[g_contextTargetIndex];
@@ -4279,10 +5258,11 @@ RBUTTON_HANDLER:
                 RefreshAssets(false); 
             } 
         }
-        else if (id == IDM_SORT_NAME || id == IDM_SORT_FAVORITE || id == IDM_SORT_CATEGORY) {
+        else if (id == IDM_SORT_NAME || id == IDM_SORT_FAVORITE || id == IDM_SORT_CATEGORY || id == IDM_SORT_CUSTOM) {
             if (id == IDM_SORT_NAME) g_sortMode = 0;
             else if (id == IDM_SORT_FAVORITE) g_sortMode = 1;
-            else g_sortMode = 2;
+            else if (id == IDM_SORT_CATEGORY) g_sortMode = 2;
+            else g_sortMode = 3;
             SaveConfig();
             UpdateDisplayList();
         }
@@ -4330,8 +5310,8 @@ RBUTTON_HANDLER:
             }
         }
         if (y > listTop && y < rc.bottom - GetBottomReservedHeight()) {
-            int cols = (std::max)(1, (int)rc.right / MIN_ITEM_WIDTH); int cw = (int)rc.right / cols;
-            int idx = ((y - listTop + g_scrollY) / ITEM_HEIGHT) * cols + (x / cw);
+            int cols = (std::max)(1, (int)rc.right / GetListItemMinWidth()); int cw = (int)rc.right / cols;
+            int idx = ((y - listTop + g_scrollY) / GetListItemHeight()) * cols + (x / cw);
             if (idx >= 0 && idx < (int)g_displayAssets.size()) {
                 if (g_enableTextStyle && g_assetViewTab == 1) {
                     Asset* p = g_displayAssets[idx];
@@ -4341,6 +5321,16 @@ RBUTTON_HANDLER:
                     }
                     ApplyTextStyleFromAssetPath(hwnd, p->path);
                     InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+                bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                if (ctrlDown && CanStartCustomReorder()) {
+                    SetCapture(hwnd);
+                    g_selectedIndex = idx;
+                    g_isReorderDrag = true;
+                    g_reorderFromIndex = idx;
+                    g_reorderInsertPos = GetInsertPosFromPoint(x, y, rc);
+                    InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
                 SetCapture(hwnd);
@@ -4357,9 +5347,11 @@ RBUTTON_HANDLER:
                 UINT f0 = MF_STRING | (g_sortMode == 0 ? MF_CHECKED : 0);
                 UINT f1 = MF_STRING | (g_sortMode == 1 ? MF_CHECKED : 0);
                 UINT f2 = MF_STRING | (g_sortMode == 2 ? MF_CHECKED : 0);
+                UINT f3 = MF_STRING | (g_sortMode == 3 ? MF_CHECKED : 0);
                 AppendMenuW(hmSort, f1, IDM_SORT_FAVORITE, L"お気に入り優先");
                 AppendMenuW(hmSort, f0, IDM_SORT_NAME, L"名前順");
                 AppendMenuW(hmSort, f2, IDM_SORT_CATEGORY, L"カテゴリ順");
+                AppendMenuW(hmSort, f3, IDM_SORT_CUSTOM, L"カスタム");
                 POINT pt; GetCursorPos(&pt);
                 TrackPopupMenu(hmSort, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
                 DestroyMenu(hmSort);
@@ -4378,45 +5370,92 @@ RBUTTON_HANDLER:
         return 0; 
     }
     case WM_LBUTTONUP: { 
+        if (g_isReorderDrag) {
+            bool moved = ApplyCustomReorderFromInsertPos();
+            if (moved && CanStartCustomReorder()) {
+                SaveCurrentDisplayOrderForCategory();
+            }
+            g_isReorderDrag = false;
+            g_reorderFromIndex = -1;
+            g_reorderInsertPos = -1;
+            ReleaseCapture();
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         ReleaseCapture(); 
         g_isDragCheck = false; return 0; 
     }
     case WM_MOUSEMOVE: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp); RECT rc; GetClientRect(hwnd, &rc);
         if (!g_isMouseTracking) { TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 }; TrackMouseEvent(&tme); g_isMouseTracking = true; }
+        bool pausePreviewForReorder = CanStartCustomReorder() && (((GetKeyState(VK_CONTROL) & 0x8000) != 0) || g_isReorderDrag);
+        if (pausePreviewForReorder) {
+            KillTimer(hwnd, ID_TIMER_HOVER);
+            g_previewAllLastTick = 0;
+            g_previewHoverLastTick = 0;
+        }
+
+        if (g_isReorderDrag) {
+            int insertPos = GetInsertPosFromPoint(x, y, rc);
+            if (insertPos != g_reorderInsertPos) {
+                g_reorderInsertPos = insertPos;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
         
         bool onMark = false;
         int listTop = GetListTopY();
         bool mouseInList = (y > listTop && y < rc.bottom - GetBottomReservedHeight() && x >= 0 && x < rc.right);
         if (mouseInList) {
-            if (g_previewPlaybackMode == 1) {
+            if (!pausePreviewForReorder && g_previewPlaybackMode == 1) {
                 if (g_previewAllLastTick == 0) g_previewAllLastTick = GetTickCount64();
                 SetTimer(hwnd, ID_TIMER_HOVER, GetPreviewAllTickMs(), NULL);
             }
-            int cols = (std::max)(1, (int)rc.right / MIN_ITEM_WIDTH); int cw = (int)rc.right / cols;
-            int row = (y - listTop + g_scrollY) / ITEM_HEIGHT; int col = x / cw;
+            int itemH = GetListItemHeight();
+            int cols = (std::max)(1, (int)rc.right / GetListItemMinWidth()); int cw = (int)rc.right / cols;
+            int row = (y - listTop + g_scrollY) / itemH; int col = x / cw;
             int idx = row * cols + col;
             
             if (idx >= 0 && idx < (int)g_displayAssets.size()) { 
                 if (g_hoverIndex != idx) {
                     g_hoverIndex = idx;
-                    if (g_previewPlaybackMode == 0) {
+                    if (!pausePreviewForReorder && g_previewPlaybackMode == 0) {
                         g_previewHoverLastTick = 0;
                         SetTimer(hwnd, ID_TIMER_HOVER, GetPreviewAllTickMs(), NULL);
                     }
                 }
 
-                int itemX = col * cw; int itemY = row * ITEM_HEIGHT + (listTop - g_scrollY);
-                int right = itemX + cw - 2; int bottom = itemY + ITEM_HEIGHT - 2;
-                RECT rcMark = { right - 30, bottom - 30, right, bottom };
+                int itemX = col * cw; int itemY = row * itemH + (listTop - g_scrollY);
                 POINT pt = {x, y};
-                
-                if (PtInRect(&rcMark, pt)) {
-                    onMark = true;
-                    if (g_tooltipTargetIndex != idx) {
-                        HideMyTooltip();
-                        g_tooltipTargetIndex = idx;
-                        SetTimer(hwnd, ID_TIMER_TOOLTIP, 1000, NULL);
+
+                if (g_previewThumbOnly) {
+                    int thumbW = GetThumbWScaled();
+                    int thumbH = GetThumbHScaled();
+                    RECT rcThumb = {
+                        itemX + (cw - thumbW) / 2,
+                        itemY + (itemH - thumbH) / 2,
+                        itemX + (cw - thumbW) / 2 + thumbW,
+                        itemY + (itemH - thumbH) / 2 + thumbH
+                    };
+                    if (PtInRect(&rcThumb, pt)) {
+                        onMark = true;
+                        if (g_tooltipTargetIndex != idx) {
+                            HideMyTooltip();
+                            g_tooltipTargetIndex = idx;
+                            SetTimer(hwnd, ID_TIMER_TOOLTIP, 1000, NULL);
+                        }
+                    }
+                } else {
+                    int right = itemX + cw - 2; int bottom = itemY + itemH - 2;
+                    RECT rcMark = { right - 30, bottom - 30, right, bottom };
+                    if (PtInRect(&rcMark, pt)) {
+                        onMark = true;
+                        if (g_tooltipTargetIndex != idx) {
+                            HideMyTooltip();
+                            g_tooltipTargetIndex = idx;
+                            SetTimer(hwnd, ID_TIMER_TOOLTIP, 1000, NULL);
+                        }
                     }
                 }
             } else {
@@ -4718,6 +5757,7 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
         g_addDialogRangeStart = parsedStart;
         g_addDialogRangeEnd = parsedEnd;
     }
+    g_addDialogFromMyAssetAdd = true;
     OpenAddDialog(bodyData, false);
 }
 
@@ -4764,7 +5804,23 @@ void OnShowMainWindow(EDIT_SECTION_SAFE* edit) {
     SetForegroundWindow(g_hwnd);
 }
 
-void CreatePluginWindow() { LoadWindowConfig(); WNDCLASSW wc = {0}; wc.lpfnWndProc = WndProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAssetMgr_Modern"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = g_hBrBg; wc.style = CS_HREDRAW | CS_VREDRAW; RegisterClassW(&wc); g_hwnd = CreateWindowExW(WS_EX_TOPMOST, L"MyAssetMgr_Modern", L"My Asset Manager", WS_POPUP | WS_CLIPCHILDREN | WS_VSCROLL, g_winX, g_winY, g_winW, g_winH, nullptr, nullptr, g_hInst, nullptr); }
+void CreatePluginWindow() { 
+    LoadWindowConfig(); 
+    WNDCLASSW wc = {0}; 
+    wc.lpfnWndProc = WndProc; 
+    wc.hInstance = g_hInst; 
+    wc.lpszClassName = L"MyAssetMgr_Modern"; 
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW); 
+    wc.hbrBackground = g_hBrBg; 
+    wc.style = CS_HREDRAW | CS_VREDRAW; 
+    RegisterClassW(&wc); 
+    HWND hostMain = FindHostMainWindow();
+    g_hwnd = CreateWindowExW(
+        WS_EX_TOPMOST, L"MyAssetMgr_Modern", L"My Asset Manager",
+        WS_POPUP | WS_CLIPCHILDREN | WS_VSCROLL,
+        g_winX, g_winY, g_winW, g_winH,
+        hostMain, nullptr, g_hInst, nullptr);
+}
 
 extern "C" __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) { 
     HMODULE hm; GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)RegisterPlugin, &hm); g_hInst = (HINSTANCE)hm;
