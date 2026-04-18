@@ -1,6 +1,6 @@
 // ------------------------------------------------------------
 // MyAssetManager.cpp
-// v1.8
+// v1.8.2
 // ------------------------------------------------------------
 
 #define NOMINMAX
@@ -52,12 +52,15 @@ using namespace Gdiplus;
 
 // --- ID定義 ---
 #define WM_REFRESH_ASSETS       (WM_USER + 100)
+#define WM_APP_DEBUG_LAYER_COMPARE (WM_APP + 77)
+#define WM_APP_BUILD_ADD_ASSET  (WM_APP + 78)
 #define ID_TIMER_HOVER          998
 #define ID_TIMER_ADD_PREVIEW    997 
 #define ID_TIMER_TOOLTIP        996 
 #define ID_TIMER_GIF_HINT       995
 #define ID_TIMER_GIF_HINT_POLL  994
 #define ID_TIMER_HIDE_MAIN_AFTER_EXPORT 993
+#define ID_TIMER_LAYER_API_COMPARE 992
 
 #define ID_COMBO_CATEGORY 200
 #define ID_BTN_FAV_SORT   201
@@ -171,7 +174,7 @@ static COLORREF COL_TIP_BORDER = DEF_COL_TIP_BORDER;
 static COLORREF COL_TIP_TEXT   = DEF_COL_TIP_TEXT;
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#define MYASSET_VERSION_W L"1.8"
+#define MYASSET_VERSION_W L"1.8.2"
 static const wchar_t* kGithubReleaseBase = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/releases/tag/v";
 static const wchar_t* kGithubBugReportUrl = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/issues/new/choose";
 
@@ -292,6 +295,8 @@ static std::wstring g_currentCategory = L"ALL", g_searchQuery = L"";
 static std::set<std::wstring> g_favPaths; 
 static std::set<std::wstring> g_fixedPaths; 
 static std::set<std::wstring> g_textStylePaths;
+// デバッグ時trueに変更
+static constexpr bool kEnableDebugByCode = false;
 static std::map<std::wstring, std::vector<std::wstring>> g_customOrderByCategory;
 static int g_sortMode = 0;
 static int g_gifSpeedPercent = 100;
@@ -313,6 +318,13 @@ static bool g_suppressMainShow = false;
 static bool g_enableMainWindowTrace = false;
 static int g_hideMainAfterExportTicks = 0;
 static int g_settingsCategory = 0;
+static bool g_pendingLayerApiCompare = false;
+static std::vector<void*> g_pendingLayerApiCompareObjs;
+struct PendingAddObjSnapshot {
+    void* obj = nullptr;
+    std::string alias;
+};
+static std::vector<PendingAddObjSnapshot> g_pendingAddObjSnapshots;
 static bool g_addDialogFromMyAssetAdd = false;
 
 static int g_winX = 100, g_winY = 100, g_winW = 360, g_winH = 550;
@@ -383,7 +395,9 @@ static bool g_addGifHintTimerStarted = false;
 static bool g_addDlgMouseTracking = false;
 static ULONGLONG g_addGifHoverStartTick = 0;
 static bool g_textStylePending = false;
-static void* g_textStylePendingObj = nullptr;
+static int g_textStylePendingLayer = -1;
+static int g_textStylePendingStart = -1;
+static int g_textStylePendingEnd = -1;
 static std::string g_textStyleOriginalAlias;
 static int g_inheritExpandedGroup = -1;
 static int g_quickInheritExpandedGroup = -1;
@@ -486,6 +500,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static LRESULT CALLBACK TextStyleQuickDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static int GetObjectLayerIndex(void* obj);
 static bool SafeReadIntAtOffset(void* obj, int offset, int& outValue);
+static bool SafeReadUIntPtrAtOffset(void* obj, int offset, uintptr_t& outValue);
 static std::string WideToUtf8(const std::wstring& w);
 void OpenAddDialog(const std::string& data, bool isEdit);
 int ShowDarkMsg(HWND parent, LPCWSTR text, LPCWSTR title, UINT type);
@@ -736,6 +751,8 @@ static int ExtractHeaderIntValue(const std::string& src, const std::string& key)
     return 0;
 }
 
+// aliasテキスト内の frame= 行を走査して、全体の最小開始/最大終了を返す。
+
 static bool ExtractHeaderFrameRange(const std::string& src, int& outStart, int& outEnd) {
     auto parseFramePair = [](const std::string& line, int& s, int& e) -> bool {
         std::string t = TrimAscii(line);
@@ -748,29 +765,29 @@ static bool ExtractHeaderFrameRange(const std::string& src, int& outStart, int& 
         i++;
         while (i < t.size() && isspace((unsigned char)t[i])) i++;
 
-        size_t b1 = i;
-        if (i < t.size() && (t[i] == '+' || t[i] == '-')) i++;
-        size_t d1 = i;
-        while (i < t.size() && isdigit((unsigned char)t[i])) i++;
-        if (d1 == i) return false;
+        // frame= a,b の2値だけでなく、余分な値があっても先頭/末尾を使う。
+        std::vector<int> vals;
+        while (i < t.size()) {
+            while (i < t.size() && (isspace((unsigned char)t[i]) || t[i] == ',')) i++;
+            if (i >= t.size()) break;
 
-        size_t e1 = i;
-        while (i < t.size() && (isspace((unsigned char)t[i]) || t[i] == ',')) i++;
+            size_t b = i;
+            if (t[i] == '+' || t[i] == '-') i++;
+            size_t d = i;
+            while (i < t.size() && isdigit((unsigned char)t[i])) i++;
+            if (d == i) break;
 
-        size_t b2 = i;
-        if (i < t.size() && (t[i] == '+' || t[i] == '-')) i++;
-        size_t d2 = i;
-        while (i < t.size() && isdigit((unsigned char)t[i])) i++;
-        if (d2 == i) return false;
-        size_t e2 = i;
-
-        try {
-            s = std::stoi(t.substr(b1, e1 - b1));
-            e = std::stoi(t.substr(b2, e2 - b2));
-            return true;
-        } catch (...) {
-            return false;
+            try {
+                vals.push_back(std::stoi(t.substr(b, i - b)));
+            } catch (...) {
+                return false;
+            }
         }
+
+        if (vals.size() < 2) return false;
+        s = vals.front();
+        e = vals.back();
+        return true;
     };
 
     std::stringstream ss(src);
@@ -1103,7 +1120,7 @@ static void ApplyTextStyleInheritanceItems(const std::string& originalAlias, std
         bool foundFirst = false;
         for (auto& dstSec : dstSections) {
             if (GetSectionEffectName(dstSec) != eff) continue;
-            if (!foundFirst) { foundFirst = true; continue; } // 先頭は既存側とみなし、追加入り分のみ反映
+            if (!foundFirst) { foundFirst = true; continue; }
             SetSectionItemValue(dstSec, key, v);
         }
     }
@@ -1117,11 +1134,40 @@ struct TextStyleApplyContext {
     bool success = false;
     bool hasError = false;
     std::wstring errorMessage;
-    void* newObject = nullptr;
+    int pendingLayer = -1;
+    int pendingStart = -1;
+    int pendingEnd = -1;
 };
 
+
 static int GetVerifiedTimelineGroupId(void* obj) {
-    (void)obj;
+    if (!obj) return 0;
+
+    auto isLikelyGroupToken = [](uintptr_t v) -> bool {
+        if (v == 0) return false;
+        if (v == (uintptr_t)~(uintptr_t)0) return false;
+#if INTPTR_MAX == INT64_MAX
+        if (v == 0xFFFFFFFFFFFFFFFEULL) return false;
+#else
+        if (v == 0xFFFFFFFEUL) return false;
+#endif
+        if (v < 0x10000) return false;
+        return true;
+    };
+
+    const int kGroupPtrOffsets[] = { 0x30, 0x38 };
+    for (int off : kGroupPtrOffsets) {
+        uintptr_t token = 0;
+        if (!SafeReadUIntPtrAtOffset(obj, off, token)) continue;
+        if (!isLikelyGroupToken(token)) continue;
+        unsigned long long mixed = (unsigned long long)token;
+        mixed ^= (mixed >> 33);
+        mixed ^= (mixed >> 17);
+        int gid = (int)(mixed & 0x7FFFFFFF);
+        if (gid == 0) gid = 1;
+        return gid;
+    }
+
     return 0;
 }
 
@@ -1260,9 +1306,48 @@ static std::string NormalizeSingleObjectContent(const std::string& src) {
     return s;
 }
 
-static int GetObjectLayerIndex(void* obj) {
+static int GetObjectLayerIndex(void* obj, int* outOffset) {
+    if (outOffset) *outOffset = 0;
     if (!obj) return 0;
-    return *(int*)((char*)obj + 0x60); 
+
+    const int kLayerOffsets[] = { 0x60, 0x68, 0x118 };
+    for (int off : kLayerOffsets) {
+        int v = 0;
+        if (!SafeReadIntAtOffset(obj, off, v)) continue;
+        if (v > 0 && v < 1000000) {
+            if (outOffset) *outOffset = off;
+            return v;
+        }
+    }
+    return 0;
+}
+
+static int GetObjectLayerIndex(void* obj) {
+    return GetObjectLayerIndex(obj, nullptr);
+}
+
+static int ResolveObjectLayerForAssetBuild(void* obj, LPCSTR rawAlias, const char** outSource = nullptr) {
+    if (outSource) *outSource = "fallback";
+    if (rawAlias) {
+        int aliasLayer = ExtractHeaderIntValue(rawAlias, "layer=");
+        if (aliasLayer > 0) {
+            if (outSource) *outSource = "alias";
+            return aliasLayer;
+        }
+    }
+    int memOff = 0;
+    int memLayer = GetObjectLayerIndex(obj, &memOff);
+    if (memLayer > 0 && memLayer < 1000000) {
+        if (outSource) {
+            if (memOff == 0x60) *outSource = "mem+0x60";
+            else if (memOff == 0x68) *outSource = "mem+0x68";
+            else if (memOff == 0x118) *outSource = "mem+0x118";
+            else *outSource = "mem+offset";
+        }
+        return memLayer;
+    }
+    if (outSource) *outSource = "fallback=1";
+    return 1;
 }
 
 static bool TryGetObjectFrameRangeFromMemory(void* obj, int& outStart, int& outEnd) {
@@ -1406,6 +1491,225 @@ static void DumpGroupMemoryProbe(const std::vector<void*>& selectedObjs) {
         }
     }
     AppendGroupDebugLine("  ---- memory probe end ----");
+}
+
+static void DumpGroupIdCandidateProbe(const std::vector<void*>& selectedObjs) {
+    if (selectedObjs.size() < 2) return;
+    auto isSentinelInt = [](int v) -> bool {
+        return v == 0 || v == -1 || v == -2;
+    };
+    auto isSentinelPtr = [](uintptr_t v) -> bool {
+        if (v == 0) return true;
+        if (v == (uintptr_t)~(uintptr_t)0) return true;
+#if INTPTR_MAX == INT64_MAX
+        if (v == 0xFFFFFFFFFFFFFFFEULL) return true;
+#else
+        if (v == 0xFFFFFFFEUL) return true;
+#endif
+        return false;
+    };
+
+    struct IntCand {
+        int off = 0;
+        int uniqueCount = 0;
+        int maxBucket = 0;
+        int validCount = 0;
+        int zeroCount = 0;
+        int score = 0;
+        std::string vals;
+    };
+    std::vector<IntCand> intCands;
+
+    for (int off = 0x20; off <= 0x240; off += 4) {
+        std::map<int, int> freq;
+        std::map<int, int> freqNonSentinel;
+        int validCount = 0;
+        int zeroCount = 0;
+        int nonSentinelCount = 0;
+        std::ostringstream vals;
+        vals << "    int off=0x" << std::hex << off << std::dec << " values=";
+
+        for (size_t i = 0; i < selectedObjs.size(); ++i) {
+            int v = 0;
+            if (!SafeReadIntAtOffset(selectedObjs[i], off, v)) {
+                vals << " [i" << i << ":ERR]";
+                continue;
+            }
+            validCount++;
+            if (v == 0) zeroCount++;
+            freq[v]++;
+            if (!isSentinelInt(v)) {
+                freqNonSentinel[v]++;
+                nonSentinelCount++;
+            }
+            vals << " [i" << i << ":" << v << "]";
+        }
+        if (validCount < 2) continue;
+
+        int uniqueCount = (int)freq.size();
+        int maxBucket = 0;
+        for (const auto& kv : freq) if (kv.second > maxBucket) maxBucket = kv.second;
+        int uniqueNonSentinel = (int)freqNonSentinel.size();
+        int maxBucketNonSentinel = 0;
+        int repeatedBuckets = 0;
+        for (const auto& kv : freqNonSentinel) if (kv.second > maxBucketNonSentinel) maxBucketNonSentinel = kv.second;
+        for (const auto& kv : freqNonSentinel) if (kv.second >= 2) repeatedBuckets++;
+
+        bool candidate =
+            (uniqueNonSentinel >= 2) &&
+            (uniqueNonSentinel < validCount) &&
+            (maxBucketNonSentinel >= 2) &&
+            (repeatedBuckets >= 1);
+        if (!candidate) continue;
+
+        IntCand c = {};
+        c.off = off;
+        c.uniqueCount = uniqueCount;
+        c.maxBucket = maxBucket;
+        c.validCount = validCount;
+        c.zeroCount = zeroCount;
+        c.score = maxBucketNonSentinel * 140 + repeatedBuckets * 40 + nonSentinelCount * 4 - uniqueNonSentinel * 12 - zeroCount * 3;
+        c.vals = vals.str();
+        intCands.push_back(c);
+    }
+
+    struct PtrCand {
+        int off = 0;
+        int uniqueCount = 0;
+        int maxBucket = 0;
+        int validCount = 0;
+        int nullCount = 0;
+        int score = 0;
+        std::string vals;
+    };
+    std::vector<PtrCand> ptrCands;
+
+    for (int off = 0x20; off <= 0x180; off += (int)sizeof(uintptr_t)) {
+        std::map<uintptr_t, int> freq;
+        std::map<uintptr_t, int> freqNonSentinel;
+        int validCount = 0;
+        int nullCount = 0;
+        int nonSentinelCount = 0;
+        std::ostringstream vals;
+        vals << "    ptr off=0x" << std::hex << off << std::dec << " values=";
+
+        for (size_t i = 0; i < selectedObjs.size(); ++i) {
+            uintptr_t v = 0;
+            if (!SafeReadUIntPtrAtOffset(selectedObjs[i], off, v)) {
+                vals << " [i" << i << ":ERR]";
+                continue;
+            }
+            validCount++;
+            if (v == 0) nullCount++;
+            freq[v]++;
+            if (!isSentinelPtr(v)) {
+                freqNonSentinel[v]++;
+                nonSentinelCount++;
+            }
+            vals << " [i" << i << ":0x" << std::hex << (unsigned long long)v << std::dec << "]";
+        }
+        if (validCount < 2) continue;
+
+        int uniqueCount = (int)freq.size();
+        int maxBucket = 0;
+        for (const auto& kv : freq) if (kv.second > maxBucket) maxBucket = kv.second;
+        int uniqueNonSentinel = (int)freqNonSentinel.size();
+        int maxBucketNonSentinel = 0;
+        int repeatedBuckets = 0;
+        for (const auto& kv : freqNonSentinel) if (kv.second > maxBucketNonSentinel) maxBucketNonSentinel = kv.second;
+        for (const auto& kv : freqNonSentinel) if (kv.second >= 2) repeatedBuckets++;
+
+        bool candidate =
+            (uniqueNonSentinel >= 2) &&
+            (uniqueNonSentinel < validCount) &&
+            (maxBucketNonSentinel >= 2) &&
+            (repeatedBuckets >= 1);
+        if (!candidate) continue;
+
+        PtrCand c = {};
+        c.off = off;
+        c.uniqueCount = uniqueCount;
+        c.maxBucket = maxBucket;
+        c.validCount = validCount;
+        c.nullCount = nullCount;
+        c.score = maxBucketNonSentinel * 140 + repeatedBuckets * 40 + nonSentinelCount * 4 - uniqueNonSentinel * 12 - nullCount * 3;
+        c.vals = vals.str();
+        ptrCands.push_back(c);
+    }
+
+    std::sort(intCands.begin(), intCands.end(), [](const IntCand& a, const IntCand& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.off < b.off;
+    });
+    std::sort(ptrCands.begin(), ptrCands.end(), [](const PtrCand& a, const PtrCand& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.off < b.off;
+    });
+
+    AppendGroupDebugLine("  ---- group-id candidate probe begin ----");
+    {
+        std::ostringstream os;
+        os << "  selected=" << selectedObjs.size()
+           << " intCandidates=" << intCands.size()
+           << " ptrCandidates=" << ptrCands.size();
+        AppendGroupDebugLine(os.str());
+    }
+
+    int intLimit = (std::min)(20, (int)intCands.size());
+    for (int i = 0; i < intLimit; ++i) {
+        const auto& c = intCands[(size_t)i];
+        std::ostringstream os;
+        os << "  [int#" << i
+           << "] off=0x" << std::hex << c.off << std::dec
+           << " score=" << c.score
+           << " unique=" << c.uniqueCount
+           << " maxBucket=" << c.maxBucket
+           << " valid=" << c.validCount
+           << " zero=" << c.zeroCount;
+        AppendGroupDebugLine(os.str());
+        AppendGroupDebugLine(c.vals);
+    }
+
+    int ptrLimit = (std::min)(12, (int)ptrCands.size());
+    for (int i = 0; i < ptrLimit; ++i) {
+        const auto& c = ptrCands[(size_t)i];
+        std::ostringstream os;
+        os << "  [ptr#" << i
+           << "] off=0x" << std::hex << c.off << std::dec
+           << " score=" << c.score
+           << " unique=" << c.uniqueCount
+           << " maxBucket=" << c.maxBucket
+           << " valid=" << c.validCount
+           << " null=" << c.nullCount;
+        AppendGroupDebugLine(os.str());
+        AppendGroupDebugLine(c.vals);
+    }
+    AppendGroupDebugLine("  ---- group-id candidate probe end ----");
+}
+
+static void DumpLayerOffsetProbe(const std::vector<void*>& selectedObjs) {
+    if (selectedObjs.empty()) return;
+    AppendGroupDebugLine("  ---- layer offset probe begin ----");
+    AppendGroupDebugLine("  candidates: 0x60, 0x68, 0x118");
+    for (size_t i = 0; i < selectedObjs.size(); ++i) {
+        void* obj = selectedObjs[i];
+        int v60 = 0, v68 = 0, v118 = 0;
+        bool ok60 = SafeReadIntAtOffset(obj, 0x60, v60);
+        bool ok68 = SafeReadIntAtOffset(obj, 0x68, v68);
+        bool ok118 = SafeReadIntAtOffset(obj, 0x118, v118);
+        int chosenOff = 0;
+        int chosen = GetObjectLayerIndex(obj, &chosenOff);
+
+        std::ostringstream os;
+        os << "  layer-probe idx=" << i
+           << " chosen=" << chosen
+           << " chosenOff=0x" << std::hex << chosenOff << std::dec
+           << " v60=" << (ok60 ? std::to_string(v60) : std::string("ERR"))
+           << " v68=" << (ok68 ? std::to_string(v68) : std::string("ERR"))
+           << " v118=" << (ok118 ? std::to_string(v118) : std::string("ERR"));
+        AppendGroupDebugLine(os.str());
+    }
+    AppendGroupDebugLine("  ---- layer offset probe end ----");
 }
 
 static std::wstring GetFavFilePath() { 
@@ -1622,6 +1926,7 @@ static std::string EscapeJsonString(const std::string& s) {
 }
 
 static void SyncSetsFromMetaMap() {
+    // JSONメタを既存の高速参照セットに展開する。
     g_favPaths.clear();
     g_fixedPaths.clear();
     g_textStylePaths.clear();
@@ -1633,6 +1938,7 @@ static void SyncSetsFromMetaMap() {
 }
 
 static void RebuildMetaMapFromSets() {
+    // 既存処理が更新した set 群をJSON保存用mapへ戻す。
     std::map<std::wstring, AssetMetaFlags> nextMap;
     for (const auto& p : g_favPaths) nextMap[p].favorite = true;
     for (const auto& p : g_fixedPaths) nextMap[p].fixedFrame = true;
@@ -1945,6 +2251,7 @@ static void LoadConfig() {
     if (g_previewZoomPercent < 50) g_previewZoomPercent = 50;
     if (g_previewZoomPercent > 200) g_previewZoomPercent = 200;
     g_previewThumbOnly = (GetPrivateProfileIntW(L"Settings", L"PreviewThumbOnly", 0, GetConfigPath().c_str()) != 0);
+    g_enableGroupDebugDump = kEnableDebugByCode;
     g_capturePresetSlot = GetPrivateProfileIntW(L"Settings", L"CapturePresetSlot", 0, GetConfigPath().c_str());
     if (g_capturePresetSlot < 0 || g_capturePresetSlot > 2) g_capturePresetSlot = 0;
     for (int i = 0; i < 3; ++i) {
@@ -2353,6 +2660,242 @@ static bool ApplyCachedRangeToTimeline() {
     return g_editHandle->call_edit_section_param(&ctx, ApplyRangeFromContextProc) ? true : false;
 }
 
+struct LayerApiCompareContext {
+    const std::vector<void*>* objs = nullptr;
+    int total = 0;
+    int apiValid = 0;
+    int match = 0;
+    int mismatch = 0;
+};
+
+static void LayerApiCompareProc(void* param, EDIT_SECTION_OUT_SAFE* edit) {
+    auto* ctx = (LayerApiCompareContext*)param;
+    if (!ctx || !ctx->objs || !edit || !edit->get_object_layer_frame) return;
+    if (ctx->objs->empty()) return;
+
+    AppendGroupDebugLine("  ---- layer api compare begin ----");
+    for (size_t i = 0; i < ctx->objs->size(); ++i) {
+        void* obj = (*ctx->objs)[i];
+        if (!obj) continue;
+        ctx->total++;
+
+        OBJECT_LAYER_FRAME_SAFE lf = edit->get_object_layer_frame(obj);
+        int apiLayer = lf.layer;
+        int memOff = 0;
+        int memLayer = GetObjectLayerIndex(obj, &memOff);
+
+        bool ok = (apiLayer > 0);
+        if (ok) ctx->apiValid++;
+        bool matched = (ok && memLayer > 0 && apiLayer == memLayer);
+        if (matched) ctx->match++;
+        else if (ok) ctx->mismatch++;
+
+        std::ostringstream os;
+        os << "  layer-api idx=" << i
+           << " api=" << apiLayer
+           << " mem=" << memLayer
+           << " memOff=0x" << std::hex << memOff << std::dec
+           << " match=" << (matched ? 1 : 0);
+        AppendGroupDebugLine(os.str());
+    }
+    std::ostringstream sum;
+    sum << "  layer-api summary total=" << ctx->total
+        << " apiValid=" << ctx->apiValid
+        << " match=" << ctx->match
+        << " mismatch=" << ctx->mismatch;
+    AppendGroupDebugLine(sum.str());
+    AppendGroupDebugLine("  ---- layer api compare end ----");
+}
+
+static void RunLayerApiCompareDebug() {
+    // 追加直後は選択状態が変わりやすいため、事前保持した配列で比較する。
+    if (!g_enableGroupDebugDump) return;
+    if (g_pendingLayerApiCompareObjs.empty()) {
+        AppendGroupDebugLine("  layer-api compare skipped: pending object list empty");
+        return;
+    }
+    if (!g_editHandle || !g_editHandle->call_edit_section_param) {
+        AppendGroupDebugLine("  layer-api compare skipped: edit handle unavailable");
+        return;
+    }
+    LayerApiCompareContext ctx = {};
+    ctx.objs = &g_pendingLayerApiCompareObjs;
+    if (!g_editHandle->call_edit_section_param(&ctx, LayerApiCompareProc)) {
+        AppendGroupDebugLine("  layer-api compare failed: call_edit_section_param=false");
+    }
+    g_pendingLayerApiCompareObjs.clear();
+}
+
+struct AddAssetApiLayerContext {
+    const std::vector<PendingAddObjSnapshot>* snapshots = nullptr;
+    std::vector<int>* layers = nullptr;
+    std::vector<int>* starts = nullptr;
+    std::vector<int>* ends = nullptr;
+};
+
+static void CollectApiLayersForPendingAddProc(void* param, EDIT_SECTION_OUT_SAFE* edit) {
+    auto* ctx = (AddAssetApiLayerContext*)param;
+    if (!ctx || !ctx->snapshots || !ctx->layers || !ctx->starts || !ctx->ends) return;
+    if (!edit || !edit->get_object_layer_frame) return;
+
+    size_t n = ctx->snapshots->size();
+    ctx->layers->assign(n, 0);
+    ctx->starts->assign(n, 0);
+    ctx->ends->assign(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        void* obj = (*ctx->snapshots)[i].obj;
+        if (!obj) continue;
+        OBJECT_LAYER_FRAME_SAFE lf = edit->get_object_layer_frame(obj);
+        (*ctx->layers)[i] = lf.layer;
+        (*ctx->starts)[i] = lf.start;
+        (*ctx->ends)[i] = lf.end;
+    }
+}
+
+static void ProcessPendingAddAssetRequestByApi() {
+    // call_edit_section内で重い処理を続けると固まりやすいため、
+    // OnAddAssetでスナップショット化→ここで非同期に本処理を行う。
+    if (g_pendingAddObjSnapshots.empty()) return;
+
+    std::vector<PendingAddObjSnapshot> snaps;
+    snaps.swap(g_pendingAddObjSnapshots);
+
+    std::vector<int> apiLayers;
+    std::vector<int> apiStarts;
+    std::vector<int> apiEnds;
+    if (g_editHandle && g_editHandle->call_edit_section_param) {
+        AddAssetApiLayerContext ctx = {};
+        ctx.snapshots = &snaps;
+        ctx.layers = &apiLayers;
+        ctx.starts = &apiStarts;
+        ctx.ends = &apiEnds;
+        g_editHandle->call_edit_section_param(&ctx, CollectApiLayersForPendingAddProc);
+    }
+    if (apiLayers.size() != snaps.size()) apiLayers.assign(snaps.size(), 0);
+    if (apiStarts.size() != snaps.size()) apiStarts.assign(snaps.size(), 0);
+    if (apiEnds.size() != snaps.size()) apiEnds.assign(snaps.size(), 0);
+
+    g_addDialogRangeValid = false;
+    g_addDialogRangeStart = 0;
+    g_addDialogRangeEnd = 0;
+    // GIF書き出し用の選択範囲もここで再構築しておく。
+    int rStart = INT_MAX, rEnd = INT_MIN;
+    bool hasRange = false;
+    for (size_t i = 0; i < snaps.size(); ++i) {
+        if (apiLayers[i] <= 0) continue;
+        if (apiEnds[i] < apiStarts[i]) continue;
+        rStart = (std::min)(rStart, apiStarts[i]);
+        rEnd = (std::max)(rEnd, apiEnds[i]);
+        hasRange = true;
+    }
+    if (hasRange) {
+        g_addDialogRangeValid = true;
+        g_addDialogRangeStart = rStart;
+        g_addDialogRangeEnd = rEnd;
+    }
+
+    std::string bodyData;
+    int count = (int)snaps.size();
+    if (count == 1) {
+        bodyData = snaps[0].alias;
+    } else {
+        // 相対layer化の基準。最小レイヤーを1として再マップする。
+        int minLayer = INT_MAX;
+        for (int i = 0; i < count; ++i) {
+            int layer = apiLayers[(size_t)i];
+            if (layer <= 0) {
+                layer = ResolveObjectLayerForAssetBuild(snaps[(size_t)i].obj, snaps[(size_t)i].alias.empty() ? nullptr : snaps[(size_t)i].alias.c_str());
+            }
+            if (layer > 0 && layer < minLayer) minLayer = layer;
+        }
+        if (minLayer == INT_MAX) minLayer = 1;
+
+        std::vector<int> relativeGroups((size_t)count, 0);
+        std::map<long long, int> groupIdMap;
+        std::map<long long, int> groupCounts;
+        std::vector<long long> originalGroups((size_t)count, 0);
+        int nextGroupId = 1;
+        // group再採番のために、同一グループの対応表を作る。
+        bool hasGroupToken = false;
+
+        for (int i = 0; i < count; ++i) {
+            const std::string& rawAlias = snaps[(size_t)i].alias;
+            int aliasGroupId = rawAlias.empty() ? 0 : ExtractHeaderIntValue(rawAlias, "group=");
+            long long originalGroupId = aliasGroupId;
+            if (originalGroupId <= 0) {
+                int verifiedGroup = GetVerifiedTimelineGroupId(snaps[(size_t)i].obj);
+                if (verifiedGroup > 0) originalGroupId = verifiedGroup;
+            }
+            uintptr_t ptr28 = 0;
+            if (originalGroupId <= 0 && SafeReadUIntPtrAtOffset(snaps[(size_t)i].obj, 0x28, ptr28) && ptr28 != 0) {
+                originalGroupId = (long long)ptr28;
+            }
+            originalGroups[(size_t)i] = originalGroupId;
+            if (originalGroupId > 0) {
+                hasGroupToken = true;
+                groupCounts[originalGroupId]++;
+            }
+        }
+
+        if (hasGroupToken) {
+            for (int i = 0; i < count; ++i) {
+                long long gid = originalGroups[(size_t)i];
+                if (gid <= 0) continue;
+                if (groupCounts[gid] < 2) continue;
+                auto it = groupIdMap.find(gid);
+                if (it == groupIdMap.end()) {
+                    groupIdMap[gid] = nextGroupId;
+                    relativeGroups[(size_t)i] = nextGroupId;
+                    nextGroupId++;
+                } else {
+                    relativeGroups[(size_t)i] = it->second;
+                }
+            }
+        }
+
+        bool shouldEmitGroupField = false;
+        for (int g : relativeGroups) if (g > 0) { shouldEmitGroupField = true; break; }
+
+        for (int i = 0; i < count; ++i) {
+            const std::string& rawAlias = snaps[(size_t)i].alias;
+            if (rawAlias.empty()) continue;
+            std::string s = rawAlias;
+            std::string headerNew = "[" + std::to_string(i) + "]";
+            std::string sectionNew = "[" + std::to_string(i) + ".";
+
+            int currentLayer = apiLayers[(size_t)i];
+            if (currentLayer <= 0) {
+                currentLayer = ResolveObjectLayerForAssetBuild(snaps[(size_t)i].obj, rawAlias.c_str());
+            }
+            int relativeLayer = (currentLayer > 0) ? ((currentLayer - minLayer) + 1) : 1;
+
+            ReplaceStringAll(s, "[Object.", sectionNew);
+            ReplaceStringAll(s, "[Object]", headerNew);
+            RemoveLinesStartingWith(s, "group=");
+            size_t pos = s.find(headerNew);
+            if (pos != std::string::npos) {
+                std::string headerLines = "\r\nlayer=" + std::to_string(relativeLayer);
+                if (relativeGroups[(size_t)i] > 0) {
+                    headerLines += "\r\ngroup=" + std::to_string(relativeGroups[(size_t)i]);
+                } else if (shouldEmitGroupField) {
+                    headerLines += "\r\ngroup=0";
+                }
+                s.insert(pos + headerNew.length(), headerLines);
+            }
+            bodyData += s + "\r\n";
+        }
+    }
+
+    int parsedStart = 0, parsedEnd = 0;
+    if (!g_addDialogRangeValid && TryParseFrameRangeFromAliasData(bodyData, parsedStart, parsedEnd)) {
+        g_addDialogRangeValid = true;
+        g_addDialogRangeStart = parsedStart;
+        g_addDialogRangeEnd = parsedEnd;
+    }
+    g_addDialogFromMyAssetAdd = true;
+    OpenAddDialog(bodyData, false);
+}
+
 static bool ReplaceObjectAliasByRecreate(EDIT_SECTION_OUT_SAFE* edit, void* targetObj, const std::string& newAlias, void** outNewObj) {
     if (outNewObj) *outNewObj = nullptr;
     if (!edit || !targetObj || !edit->get_object_layer_frame || !edit->delete_object) return false;
@@ -2370,9 +2913,25 @@ static bool ReplaceObjectAliasByRecreate(EDIT_SECTION_OUT_SAFE* edit, void* targ
     std::string oldAlias;
     if (LPCSTR oldRaw = edit->get_object_alias(targetObj)) oldAlias = oldRaw;
 
+    struct CreateCandidate { int layer; int frame; };
+    std::vector<CreateCandidate> cands;
+    cands.push_back({ lf.layer, lf.end + (std::max)(2, len + 2) });
+    cands.push_back({ lf.layer + 32, lf.start });
+    cands.push_back({ (std::max)(1, lf.layer - 32), lf.start });
+    cands.push_back({ lf.layer + 64, lf.end + (std::max)(2, len + 8) });
+
+    void* newObj = nullptr;
+    for (const auto& c : cands) {
+        newObj = fnCreate(newAlias.c_str(), c.layer, c.frame, len);
+        if (newObj) break;
+    }
+    if (!newObj) return false;
+
+    // 新規生成成功後に旧オブジェクトを削除して置換
     edit->delete_object(targetObj);
-    void* newObj = fnCreate(newAlias.c_str(), lf.layer, lf.start, len);
-    if (!newObj) {
+
+    if (!edit->move_object) {
+        edit->delete_object(newObj);
         if (!oldAlias.empty()) {
             void* rollbackObj = fnCreate(oldAlias.c_str(), lf.layer, lf.start, len);
             if (rollbackObj && edit->set_focus_object) edit->set_focus_object(rollbackObj);
@@ -2380,7 +2939,15 @@ static bool ReplaceObjectAliasByRecreate(EDIT_SECTION_OUT_SAFE* edit, void* targ
         return false;
     }
 
-    if (edit->move_object) edit->move_object(newObj, lf.layer, lf.start);
+    if (!edit->move_object(newObj, lf.layer, lf.start)) {
+        edit->delete_object(newObj);
+        if (!oldAlias.empty()) {
+            void* rollbackObj = fnCreate(oldAlias.c_str(), lf.layer, lf.start, len);
+            if (rollbackObj && edit->set_focus_object) edit->set_focus_object(rollbackObj);
+        }
+        return false;
+    }
+
     if (edit->set_focus_object) edit->set_focus_object(newObj);
     if (outNewObj) *outNewObj = newObj;
     return true;
@@ -2447,8 +3014,13 @@ static void ApplyTextStyleProc(void* param, EDIT_SECTION_OUT_SAFE* edit) {
 
         ctx->appliedCount++;
         if (singleTarget && i == 0) {
-            ctx->newObject = newObj;
             ctx->originalAlias = targetAlias;
+            if (edit->get_object_layer_frame) {
+                OBJECT_LAYER_FRAME_SAFE lf = edit->get_object_layer_frame(newObj);
+                ctx->pendingLayer = lf.layer;
+                ctx->pendingStart = lf.start;
+                ctx->pendingEnd = lf.end;
+            }
         }
     }
     ctx->success = (ctx->appliedCount > 0);
@@ -2456,11 +3028,37 @@ static void ApplyTextStyleProc(void* param, EDIT_SECTION_OUT_SAFE* edit) {
 
 static void RestorePendingTextStyleProc(void* param, EDIT_SECTION_OUT_SAFE* edit) {
     auto* ctx = (TextStyleApplyContext*)param;
-    if (!ctx || !edit || !g_textStylePendingObj) return;
+    if (!ctx || !edit) return;
     if (ctx->originalAlias.empty()) return;
-    void* newObj = nullptr;
-    if (!ReplaceObjectAliasByRecreate(edit, g_textStylePendingObj, ctx->originalAlias, &newObj) || !newObj) return;
-    ctx->newObject = newObj;
+    if (g_textStylePendingLayer < 0 || g_textStylePendingStart < 0) return;
+
+    void* targetObj = nullptr;
+    auto matchByLocator = [&](void* obj) -> bool {
+        if (!obj || !edit->get_object_layer_frame) return false;
+        OBJECT_LAYER_FRAME_SAFE lf = edit->get_object_layer_frame(obj);
+        if (lf.layer != g_textStylePendingLayer) return false;
+        if (lf.start != g_textStylePendingStart) return false;
+        return true;
+    };
+
+    if (edit->get_focus_object) {
+        void* focus = edit->get_focus_object();
+        if (matchByLocator(focus)) targetObj = focus;
+    }
+    if (!targetObj && edit->get_selected_object_num && edit->get_selected_object) {
+        int n = edit->get_selected_object_num();
+        for (int i = 0; i < n; ++i) {
+            void* obj = edit->get_selected_object(i);
+            if (matchByLocator(obj)) {
+                targetObj = obj;
+                break;
+            }
+        }
+    }
+    if (!targetObj) return;
+
+    void* replacedObj = nullptr;
+    if (!ReplaceObjectAliasByRecreate(edit, targetObj, ctx->originalAlias, &replacedObj) || !replacedObj) return;
     ctx->success = true;
 }
 
@@ -2483,21 +3081,27 @@ static bool ApplyTextStyleFromAssetPath(HWND owner, const std::wstring& assetPat
         return false;
     }
 
-    if (ctx.appliedCount == 1 && ctx.newObject && !ctx.originalAlias.empty()) {
+    if (ctx.appliedCount == 1 && !ctx.originalAlias.empty() && ctx.pendingLayer >= 0 && ctx.pendingStart >= 0) {
         g_textStylePending = true;
-        g_textStylePendingObj = ctx.newObject;
+        g_textStylePendingLayer = ctx.pendingLayer;
+        g_textStylePendingStart = ctx.pendingStart;
+        g_textStylePendingEnd = ctx.pendingEnd;
         g_textStyleOriginalAlias = ctx.originalAlias;
     } else {
         g_textStylePending = false;
-        g_textStylePendingObj = nullptr;
+        g_textStylePendingLayer = -1;
+        g_textStylePendingStart = -1;
+        g_textStylePendingEnd = -1;
         g_textStyleOriginalAlias.clear();
     }
     return true;
 }
 
 static bool CommitPendingTextStyle(HWND owner) {
-    if (!g_textStylePending || !g_textStylePendingObj) return false;
-    g_textStylePendingObj = nullptr;
+    if (!g_textStylePending || g_textStylePendingLayer < 0 || g_textStylePendingStart < 0) return false;
+    g_textStylePendingLayer = -1;
+    g_textStylePendingStart = -1;
+    g_textStylePendingEnd = -1;
     g_textStylePending = false;
     g_textStyleOriginalAlias.clear();
     (void)owner;
@@ -2505,14 +3109,16 @@ static bool CommitPendingTextStyle(HWND owner) {
 }
 
 static bool CancelPendingTextStyle(HWND owner) {
-    if (!g_textStylePending || !g_textStylePendingObj) return false;
+    if (!g_textStylePending || g_textStylePendingLayer < 0 || g_textStylePendingStart < 0) return false;
     TextStyleApplyContext ctx = {};
     ctx.originalAlias = g_textStyleOriginalAlias;
     if (!g_editHandle || !g_editHandle->call_edit_section_param || !g_editHandle->call_edit_section_param(&ctx, RestorePendingTextStyleProc) || !ctx.success) {
         if (owner) ShowDarkMsg(owner, L"スタイル取消に失敗しました。", L"Error", MB_OK);
         return false;
     }
-    g_textStylePendingObj = nullptr;
+    g_textStylePendingLayer = -1;
+    g_textStylePendingStart = -1;
+    g_textStylePendingEnd = -1;
     g_textStylePending = false;
     g_textStyleOriginalAlias.clear();
     return true;
@@ -2693,11 +3299,16 @@ static void CaptureRect(const RECT& rc, const std::wstring& savePath) {
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
     if (w <= 0 || h <= 0) return;
     HDC hdcS = GetDC(NULL), hdcM = CreateCompatibleDC(hdcS);
-    HBITMAP hB = CreateCompatibleBitmap(hdcS, w, h); SelectObject(hdcM, hB);
+    HBITMAP hB = CreateCompatibleBitmap(hdcS, w, h);
+    HBITMAP hOld = (HBITMAP)SelectObject(hdcM, hB);
     BitBlt(hdcM, 0, 0, w, h, hdcS, rc.left, rc.top, SRCCOPY);
     Bitmap* bmp = new Bitmap(hB, NULL); CLSID clsid;
     GetEncoderClsid(L"image/png", &clsid); bmp->Save(savePath.c_str(), &clsid, NULL);
-    delete bmp; DeleteObject(hB); DeleteDC(hdcM); ReleaseDC(NULL, hdcS);
+    delete bmp;
+    SelectObject(hdcM, hOld);
+    DeleteObject(hB);
+    DeleteDC(hdcM);
+    ReleaseDC(NULL, hdcS);
 }
 
 static bool GenerateThumbnail(const std::wstring& srcPath, const std::wstring& destPath) {
@@ -4624,6 +5235,7 @@ static void DrawContent(HDC hdc, int w, int h) {
     drawTopChrome();
 
     int listBottom = h - GetBottomReservedHeight();
+    // 一覧領域だけをクリップして、ヘッダ/フッタへのはみ出し描画を防ぐ。
     int yO = listTop - g_scrollY; HRGN hr = CreateRectRgn(0, listTop, w, listBottom); SelectClipRgn(hdc, hr);
     int itemH = GetListItemHeight();
     int thumbW = GetThumbWScaled();
@@ -4692,6 +5304,7 @@ static void DrawContent(HDC hdc, int w, int h) {
 
         
     }
+    // カスタム並び替え中は、挿入位置を青バーで可視化する。
     if (g_isReorderDrag && g_reorderInsertPos >= 0 && g_reorderInsertPos <= (int)g_displayAssets.size()) {
         int ins = g_reorderInsertPos;
         int barX = 2;
@@ -4793,6 +5406,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         AppendUiDebugLine(os.str());
         return DefWindowProc(hwnd, msg, wp, lp);
     }
+    case WM_APP_DEBUG_LAYER_COMPARE:
+        RunLayerApiCompareDebug();
+        return 0;
+    case WM_APP_BUILD_ADD_ASSET:
+        ProcessPendingAddAssetRequestByApi();
+        return 0;
     case WM_CREATE: {
         OleInitialize(NULL); GdiplusStartupInput si; GdiplusStartup(&g_gdiplusToken, &si, NULL);
         g_hFontUI = CreateFontW(15,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Yu Gothic UI");
@@ -4836,6 +5455,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     
     case WM_TIMER: 
+        if (wp == ID_TIMER_LAYER_API_COMPARE) {
+            KillTimer(hwnd, ID_TIMER_LAYER_API_COMPARE);
+            if (g_pendingLayerApiCompare) {
+                g_pendingLayerApiCompare = false;
+                RunLayerApiCompareDebug();
+            }
+            return 0;
+        }
         
         if (wp == ID_TIMER_HOVER) {
             bool pausePreviewForReorder = CanStartCustomReorder() && (((GetKeyState(VK_CONTROL) & 0x8000) != 0) || g_isReorderDrag);
@@ -5541,8 +6168,13 @@ RBUTTON_HANDLER:
     }
     case WM_DESTROY: 
         SaveWindowPos(hwnd, false); 
+        g_pendingLayerApiCompare = false;
+        g_pendingLayerApiCompareObjs.clear();
+        g_pendingAddObjSnapshots.clear();
         g_textStylePending = false;
-        g_textStylePendingObj = nullptr;
+        g_textStylePendingLayer = -1;
+        g_textStylePendingStart = -1;
+        g_textStylePendingEnd = -1;
         g_textStyleOriginalAlias.clear();
         if (!g_lastTempPath.empty()) DeleteFileW(g_lastTempPath.c_str());
         if(g_hDlg) DestroyWindow(g_hDlg);
@@ -5568,6 +6200,28 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
     if (!edit || !edit->get_selected_object_num) return; 
     int count = edit->get_selected_object_num(); 
     if (count <= 0) { ShowDarkMsg(NULL, L"オブジェクトを選択してください", L"Info", MB_OK); return; }
+
+    // API方式:
+    // 選択オブジェクトとaliasを一旦保持し、コールバック外で安全に処理する。
+    if (g_hwnd && IsWindow(g_hwnd) && edit->get_selected_object && edit->get_object_alias) {
+        g_pendingAddObjSnapshots.clear();
+        g_pendingAddObjSnapshots.reserve((size_t)count);
+        for (int i = 0; i < count; ++i) {
+            void* obj = edit->get_selected_object(i);
+            if (!obj) continue;
+            LPCSTR raw = edit->get_object_alias(obj);
+            PendingAddObjSnapshot s = {};
+            s.obj = obj;
+            if (raw) s.alias = raw;
+            g_pendingAddObjSnapshots.push_back(std::move(s));
+        }
+        if (!g_pendingAddObjSnapshots.empty()) {
+            PostMessageW(g_hwnd, WM_APP_BUILD_ADD_ASSET, 0, 0);
+            return;
+        }
+    }
+
+    // ここから下は旧フォールバック経路（APIスナップショット失敗時のみ）。
     g_addDialogRangeValid = false;
     g_addDialogRangeStart = 0;
     g_addDialogRangeEnd = 0;
@@ -5585,11 +6239,6 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
             memRangeFound = true;
         }
     }
-    if (memRangeFound) {
-        g_addDialogRangeValid = true;
-        g_addDialogRangeStart = memStart;
-        g_addDialogRangeEnd = memEnd;
-    }
     
     std::string bodyData;
     int minLayer = 99999;
@@ -5597,10 +6246,12 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
     for(int i = 0; i < count; i++) {
         void* obj = edit->get_selected_object(i);
         if (obj) {
-            int layer = GetObjectLayerIndex(obj);
+            LPCSTR raw = edit->get_object_alias(obj);
+            int layer = ResolveObjectLayerForAssetBuild(obj, raw);
             if (layer < minLayer) minLayer = layer;
         }
     }
+    if (minLayer == 99999) minLayer = 1;
     
     if (count == 1) {
         void* obj = edit->get_selected_object(0);
@@ -5619,6 +6270,7 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
         }
 
         std::vector<int> relativeGroups(count, 0);
+        std::vector<int> debugResolvedLayers(count, 0);
         std::map<long long, int> groupIdMap;
         std::map<long long, int> groupCounts;
         std::vector<long long> originalGroups(count, 0);
@@ -5634,23 +6286,40 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
                << " " << st.wHour << ":" << st.wMinute << ":" << st.wSecond
                << " selected=" << count;
             AppendGroupDebugLine(os.str());
+            g_pendingLayerApiCompareObjs = selectedObjs;
             DumpGroupMemoryProbe(selectedObjs);
+            DumpGroupIdCandidateProbe(selectedObjs);
+            DumpLayerOffsetProbe(selectedObjs);
+            g_pendingLayerApiCompare = true;
+            if (g_hwnd && IsWindow(g_hwnd)) {
+                SetTimer(g_hwnd, ID_TIMER_LAYER_API_COMPARE, 1, NULL);
+                AppendGroupDebugLine("  layer-api compare trigger=timer");
+            } else {
+                AppendGroupDebugLine("  layer-api compare trigger skipped: g_hwnd unavailable");
+            }
         }
 
         for (int i = 0; i < count; i++) {
             void* obj = edit->get_selected_object(i);
             if (!obj) continue;
             LPCSTR raw = edit->get_object_alias(obj);
+            int aliasLayer = raw ? ExtractHeaderIntValue(raw, "layer=") : 0;
+            int memLayer = GetObjectLayerIndex(obj);
+            const char* layerSource = nullptr;
+            int resolvedLayer = ResolveObjectLayerForAssetBuild(obj, raw, &layerSource);
+            debugResolvedLayers[i] = resolvedLayer;
 
             int aliasGroupId = raw ? ExtractHeaderIntValue(raw, "group=") : 0;
             long long originalGroupId = aliasGroupId;
+            int verifiedGroupId = 0;
+            if (originalGroupId <= 0) {
+                verifiedGroupId = GetVerifiedTimelineGroupId(obj);
+                if (verifiedGroupId > 0) originalGroupId = (long long)verifiedGroupId;
+            }
             uintptr_t ptr28 = 0;
             bool hasPtr28 = SafeReadUIntPtrAtOffset(obj, 0x28, ptr28);
             if (originalGroupId <= 0 && hasPtr28 && ptr28 != 0) {
                 originalGroupId = (long long)ptr28;
-            }
-            if (originalGroupId <= 0) {
-                originalGroupId = (long long)GetVerifiedTimelineGroupId(obj);
             }
             originalGroups[i] = originalGroupId;
             if (raw) {
@@ -5664,8 +6333,12 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
             if (g_enableGroupDebugDump) {
                 std::ostringstream os;
                 os << "  idx=" << i
-                   << " layer=" << GetObjectLayerIndex(obj)
+                   << " layerResolved=" << resolvedLayer
+                   << " layerSrc=" << (layerSource ? layerSource : "?")
+                   << " layerAlias=" << aliasLayer
+                   << " layerMem0x60=" << memLayer
                    << " aliasGroup=" << aliasGroupId;
+                os << " verifiedGroup=" << verifiedGroupId;
                 if (hasPtr28) {
                     os << " ptr28=0x" << std::hex << (unsigned long long)ptr28 << std::dec;
                 } else {
@@ -5692,6 +6365,17 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
             } else if (g_enableGroupDebugDump) {
                 AppendGroupDebugLine("  ---- alias dump skipped (raw=null) ----");
             }
+        }
+
+        if (g_enableGroupDebugDump && count > 1) {
+            std::set<int> uniq;
+            for (int i = 0; i < count; ++i) {
+                if (debugResolvedLayers[i] > 0) uniq.insert(debugResolvedLayers[i]);
+            }
+            std::ostringstream os;
+            os << "  layer-check unique=" << uniq.size();
+            if (uniq.size() == 1) os << " [warn: all selected objects resolved to same layer]";
+            AppendGroupDebugLine(os.str());
         }
 
         if (!hasGroupToken) {
@@ -5731,7 +6415,7 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
                     std::string s = raw; 
                     std::string headerNew = "[" + std::to_string(i) + "]";
                     std::string sectionNew = "[" + std::to_string(i) + ".";
-                    int currentLayer = GetObjectLayerIndex(obj);
+                    int currentLayer = ResolveObjectLayerForAssetBuild(obj, raw);
                     int relativeLayer = (currentLayer - minLayer) + 1;
                     ReplaceStringAll(s, "[Object.", sectionNew);
                     ReplaceStringAll(s, "[Object]", headerNew);
@@ -5752,10 +6436,15 @@ void OnAddAsset(EDIT_SECTION_SAFE* edit) {
         }
     }
     int parsedStart = 0, parsedEnd = 0;
-    if (!g_addDialogRangeValid && TryParseFrameRangeFromAliasData(bodyData, parsedStart, parsedEnd)) {
+    if (TryParseFrameRangeFromAliasData(bodyData, parsedStart, parsedEnd)) {
         g_addDialogRangeValid = true;
         g_addDialogRangeStart = parsedStart;
         g_addDialogRangeEnd = parsedEnd;
+    } else if (memRangeFound) {
+        // aliasから取れない場合のみメモリ推定値を使う
+        g_addDialogRangeValid = true;
+        g_addDialogRangeStart = memStart;
+        g_addDialogRangeEnd = memEnd;
     }
     g_addDialogFromMyAssetAdd = true;
     OpenAddDialog(bodyData, false);
