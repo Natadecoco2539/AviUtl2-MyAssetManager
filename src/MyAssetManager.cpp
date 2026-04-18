@@ -1,6 +1,6 @@
 // ------------------------------------------------------------
 // MyAssetManager.cpp
-// v1.8.2
+// v1.8.3
 // ------------------------------------------------------------
 
 #define NOMINMAX
@@ -174,7 +174,7 @@ static COLORREF COL_TIP_BORDER = DEF_COL_TIP_BORDER;
 static COLORREF COL_TIP_TEXT   = DEF_COL_TIP_TEXT;
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#define MYASSET_VERSION_W L"1.8.2"
+#define MYASSET_VERSION_W L"1.8.3"
 static const wchar_t* kGithubReleaseBase = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/releases/tag/v";
 static const wchar_t* kGithubBugReportUrl = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/issues/new/choose";
 
@@ -416,6 +416,7 @@ static ThemeColorDef kThemeColors[] = {
     { L"背景", L"ThemeBg", &COL_BG, DEF_COL_BG },
     { L"タイトルバー", L"ThemeTitleBg", &COL_TITLE_BG, DEF_COL_TITLE_BG },
     { L"枠線", L"ThemeBorder", &COL_BORDER, DEF_COL_BORDER },
+    { L"フッター帯", L"ThemeFooter", &COL_FOOTER, DEF_COL_FOOTER },
     { L"アセット背景", L"ThemeItemBg", &COL_ITEM_BG, DEF_COL_ITEM_BG },
     { L"アセット選択", L"ThemeItemSel", &COL_ITEM_SEL, DEF_COL_ITEM_SEL },
     { L"文字", L"ThemeText", &COL_TEXT, DEF_COL_TEXT },
@@ -2775,6 +2776,18 @@ static void ProcessPendingAddAssetRequestByApi() {
     if (apiStarts.size() != snaps.size()) apiStarts.assign(snaps.size(), 0);
     if (apiEnds.size() != snaps.size()) apiEnds.assign(snaps.size(), 0);
 
+    // SDK差分対策:
+    // get_object_layer_frame().layer が 0-based で返る環境では最上段が 0 になる。
+    // 0 が含まれる場合のみ +1 して内部表現を 1-based に揃える。
+    bool apiLayerZeroBased = false;
+    for (int v : apiLayers) {
+        if (v == 0) { apiLayerZeroBased = true; break; }
+    }
+    auto normalizeApiLayer = [&](int v) -> int {
+        if (v < 0) return 0;
+        return apiLayerZeroBased ? (v + 1) : v;
+    };
+
     g_addDialogRangeValid = false;
     g_addDialogRangeStart = 0;
     g_addDialogRangeEnd = 0;
@@ -2782,7 +2795,7 @@ static void ProcessPendingAddAssetRequestByApi() {
     int rStart = INT_MAX, rEnd = INT_MIN;
     bool hasRange = false;
     for (size_t i = 0; i < snaps.size(); ++i) {
-        if (apiLayers[i] <= 0) continue;
+        // レイヤー値は範囲計算に不要。frameのみ有効なら採用する。
         if (apiEnds[i] < apiStarts[i]) continue;
         rStart = (std::min)(rStart, apiStarts[i]);
         rEnd = (std::max)(rEnd, apiEnds[i]);
@@ -2802,7 +2815,7 @@ static void ProcessPendingAddAssetRequestByApi() {
         // 相対layer化の基準。最小レイヤーを1として再マップする。
         int minLayer = INT_MAX;
         for (int i = 0; i < count; ++i) {
-            int layer = apiLayers[(size_t)i];
+            int layer = normalizeApiLayer(apiLayers[(size_t)i]);
             if (layer <= 0) {
                 layer = ResolveObjectLayerForAssetBuild(snaps[(size_t)i].obj, snaps[(size_t)i].alias.empty() ? nullptr : snaps[(size_t)i].alias.c_str());
             }
@@ -2863,7 +2876,7 @@ static void ProcessPendingAddAssetRequestByApi() {
             std::string headerNew = "[" + std::to_string(i) + "]";
             std::string sectionNew = "[" + std::to_string(i) + ".";
 
-            int currentLayer = apiLayers[(size_t)i];
+            int currentLayer = normalizeApiLayer(apiLayers[(size_t)i]);
             if (currentLayer <= 0) {
                 currentLayer = ResolveObjectLayerForAssetBuild(snaps[(size_t)i].obj, rawAlias.c_str());
             }
