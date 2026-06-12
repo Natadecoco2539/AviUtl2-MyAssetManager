@@ -1,6 +1,6 @@
 // ------------------------------------------------------------
 // MyAssetManager.cpp
-// v1.8.3
+// v1.9
 // ------------------------------------------------------------
 
 #define NOMINMAX
@@ -61,6 +61,8 @@ using namespace Gdiplus;
 #define ID_TIMER_GIF_HINT_POLL  994
 #define ID_TIMER_HIDE_MAIN_AFTER_EXPORT 993
 #define ID_TIMER_LAYER_API_COMPARE 992
+#define ID_TIMER_REORDER_HINT_POLL 991
+#define ID_TIMER_VARIANT_POPUP 990
 
 #define ID_COMBO_CATEGORY 200
 #define ID_BTN_FAV_SORT   201
@@ -89,6 +91,11 @@ using namespace Gdiplus;
 #define IDM_APPLY_TEXT_STYLE 311
 #define IDM_TEXT_STYLE_COMMIT 312
 #define IDM_TEXT_STYLE_CANCEL 313
+#define IDM_VARIANT_CREATE 315
+#define IDM_VARIANT_REMOVE 316
+#define IDM_VARIANT_RENAME 317
+#define IDM_VARIANT_ADD_BASE 330
+#define IDM_VARIANT_PICK_BASE 430
 
 #define IDC_EDIT_NAME     101
 #define IDC_COMBO_CAT     102
@@ -126,6 +133,7 @@ using namespace Gdiplus;
 #define ID_BTN_GUIDE_OK   404
 #define ID_BTN_GUIDE_CANCEL 405
 #define IDC_CHK_GUIDE_HIDE 406
+#define IDC_EDIT_INPUT    407
 
 // --- UI定数 ---
 static constexpr int TITLE_H        = 32;
@@ -174,7 +182,7 @@ static COLORREF COL_TIP_BORDER = DEF_COL_TIP_BORDER;
 static COLORREF COL_TIP_TEXT   = DEF_COL_TIP_TEXT;
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#define MYASSET_VERSION_W L"1.8.3"
+#define MYASSET_VERSION_W L"1.9"
 static const wchar_t* kGithubReleaseBase = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/releases/tag/v";
 static const wchar_t* kGithubBugReportUrl = L"https://github.com/Natadecoco2539/AviUtl2-MyAssetManager/issues/new/choose";
 
@@ -281,6 +289,10 @@ static HWND g_hCombo = nullptr;
 static HWND g_hSearch = nullptr;
 static HWND g_hTooltip = nullptr; 
 static HWND g_hostMainWnd = nullptr;
+static HWND g_hVariantPopup = nullptr;
+static int g_variantPopupCellW = 96;
+static int g_variantPopupCellH = 64;
+static int g_variantPopupPad = 8;
 
 static ULONG_PTR g_gdiplusToken;
 
@@ -308,6 +320,7 @@ static int g_previewZoomPercent = 100;
 static bool g_previewThumbOnly = false;
 static ULONGLONG g_previewAllLastTick = 0;
 static ULONGLONG g_previewHoverLastTick = 0;
+static ULONGLONG g_variantPopupLastTick = 0;
 static bool g_enableTextStyle = true;
 static int g_assetViewTab = 0;
 static bool g_addAsTextStyle = false;
@@ -333,12 +346,15 @@ static int g_dlgX = -1, g_dlgY = -1;
 static int g_scrollY = 0, g_selectedIndex = -1, g_contextTargetIndex = -1, g_hoverIndex = -1;
 static std::string g_tempAliasData; 
 static std::wstring g_editOrgPath, g_editName, g_editCat, g_tempImgPath, g_msgTitle, g_msgText;
+static std::wstring g_inputTitle, g_inputLabel, g_inputText;
 static bool g_isDragCheck = false, g_isImageRemoved = false, g_isSnipping = false;
 static bool g_isReorderDrag = false;
+static bool g_reorderCtrlHintVisible = false;
 static int g_reorderFromIndex = -1;
 static int g_reorderInsertPos = -1;
 static POINT g_dragStartPt = {0}, g_snipStart = {0}, g_snipEnd = {0};
 static int g_msgResult = 0;
+static int g_inputResult = 0;
 static int g_guideResult = IDCANCEL;
 static bool g_guideHideNext = false;
 static bool g_isMouseTracking = false;
@@ -505,6 +521,7 @@ static bool SafeReadUIntPtrAtOffset(void* obj, int offset, uintptr_t& outValue);
 static std::string WideToUtf8(const std::wstring& w);
 void OpenAddDialog(const std::string& data, bool isEdit);
 int ShowDarkMsg(HWND parent, LPCWSTR text, LPCWSTR title, UINT type);
+bool ShowDarkInput(HWND parent, LPCWSTR title, LPCWSTR label, const std::wstring& initialText, std::wstring& outText);
 void RefreshAssets(bool reloadFav);
 void UpdateDisplayList();
 void CreatePluginWindow();
@@ -608,6 +625,16 @@ static void ResetThemeColorsToDefault() {
     for (int i = 0; i < kThemeColorCount; ++i) {
         *kThemeColors[i].value = kThemeColors[i].defValue;
     }
+}
+
+static void ShowWindowPrepared(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if ((ex & WS_EX_LAYERED) == 0) SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+    SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    ShowWindow(hwnd, SW_SHOW);
+    RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
 }
 
 static int GetMaxScrollY(HWND hwnd) {
@@ -1879,10 +1906,17 @@ struct AssetMetaFlags {
     bool favorite = false;
     bool fixedFrame = false;
     bool textStyle = false;
+    std::wstring variantGroup;
+    std::wstring variantGroupName;
+    std::wstring variantName;
+    bool variantPrimary = false;
 };
 
 static bool g_assetMetaLoaded = false;
 static std::map<std::wstring, AssetMetaFlags> g_assetMetaMap;
+static std::map<int, std::wstring> g_variantAddCommandGroups;
+static std::map<int, std::wstring> g_variantPickCommandPaths;
+static std::vector<Asset*> g_variantPopupAssets;
 
 static void LoadPathSetFromLegacyFile(const std::wstring& filePath, std::set<std::wstring>& outSet) {
     outSet.clear();
@@ -1940,7 +1974,12 @@ static void SyncSetsFromMetaMap() {
 
 static void RebuildMetaMapFromSets() {
     // 既存処理が更新した set 群をJSON保存用mapへ戻す。
-    std::map<std::wstring, AssetMetaFlags> nextMap;
+    std::map<std::wstring, AssetMetaFlags> nextMap = g_assetMetaMap;
+    for (auto& kv : nextMap) {
+        kv.second.favorite = (g_favPaths.count(kv.first) > 0);
+        kv.second.fixedFrame = (g_fixedPaths.count(kv.first) > 0);
+        kv.second.textStyle = (g_textStylePaths.count(kv.first) > 0);
+    }
     for (const auto& p : g_favPaths) nextMap[p].favorite = true;
     for (const auto& p : g_fixedPaths) nextMap[p].fixedFrame = true;
     for (const auto& p : g_textStylePaths) nextMap[p].textStyle = true;
@@ -1951,7 +1990,7 @@ static std::string BuildMetaJsonText() {
     RebuildMetaMapFromSets();
     std::ostringstream os;
     os << "{\n";
-    os << "  \"version\": 1,\n";
+    os << "  \"version\": 2,\n";
     os << "  \"assets\": {\n";
     bool first = true;
     for (const auto& kv : g_assetMetaMap) {
@@ -1961,7 +2000,14 @@ static std::string BuildMetaJsonText() {
         os << "    \"" << pathUtf8 << "\": {";
         os << "\"favorite\": " << (kv.second.favorite ? "true" : "false") << ", ";
         os << "\"fixedFrame\": " << (kv.second.fixedFrame ? "true" : "false") << ", ";
-        os << "\"textStyle\": " << (kv.second.textStyle ? "true" : "false") << "}";
+        os << "\"textStyle\": " << (kv.second.textStyle ? "true" : "false");
+        if (!kv.second.variantGroup.empty()) {
+            os << ", \"variantGroup\": \"" << EscapeJsonString(WideToUtf8(kv.second.variantGroup)) << "\"";
+            os << ", \"variantGroupName\": \"" << EscapeJsonString(WideToUtf8(kv.second.variantGroupName)) << "\"";
+            os << ", \"variantName\": \"" << EscapeJsonString(WideToUtf8(kv.second.variantName)) << "\"";
+            os << ", \"variantPrimary\": " << (kv.second.variantPrimary ? "true" : "false");
+        }
+        os << "}";
     }
     os << "\n";
     os << "  }\n";
@@ -2085,6 +2131,20 @@ static bool ParseAssetFlagsObject(const std::string& s, size_t& i, AssetMetaFlag
             if (!JsonParseBool(s, i, flags.fixedFrame)) return false;
         } else if (key == "textStyle") {
             if (!JsonParseBool(s, i, flags.textStyle)) return false;
+        } else if (key == "variantGroup") {
+            std::string v;
+            if (!JsonParseString(s, i, v)) return false;
+            flags.variantGroup = Utf8ToWide(v);
+        } else if (key == "variantGroupName") {
+            std::string v;
+            if (!JsonParseString(s, i, v)) return false;
+            flags.variantGroupName = Utf8ToWide(v);
+        } else if (key == "variantName") {
+            std::string v;
+            if (!JsonParseString(s, i, v)) return false;
+            flags.variantName = Utf8ToWide(v);
+        } else if (key == "variantPrimary") {
+            if (!JsonParseBool(s, i, flags.variantPrimary)) return false;
         } else {
             if (!JsonSkipValue(s, i)) return false;
         }
@@ -2151,6 +2211,278 @@ static bool SaveAssetMeta() {
     std::string jsonText = BuildMetaJsonText();
     WriteFileContent(GetMetaFilePath(), jsonText);
     return true;
+}
+
+static AssetMetaFlags* GetAssetMetaForPath(const std::wstring& path) {
+    auto it = g_assetMetaMap.find(path);
+    if (it == g_assetMetaMap.end()) return nullptr;
+    return &it->second;
+}
+
+static AssetMetaFlags& EnsureAssetMetaForPath(const std::wstring& path) {
+    return g_assetMetaMap[path];
+}
+
+static std::wstring MakeVariantGroupId() {
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    wchar_t buf[96] = {};
+    swprintf_s(
+        buf, L"vg_%04d%02d%02d_%02d%02d%02d_%03d",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    return std::wstring(buf);
+}
+
+static std::wstring GetVariantNameForAsset(const Asset& a) {
+    if (auto* meta = GetAssetMetaForPath(a.path)) {
+        if (!meta->variantName.empty()) return meta->variantName;
+    }
+    return a.name;
+}
+
+static std::wstring GetVariantGroupDisplayName(const std::wstring& groupId) {
+    if (groupId.empty()) return L"";
+    std::wstring primaryName;
+    std::wstring firstAssetName;
+    for (const auto& a : g_assets) {
+        auto* meta = GetAssetMetaForPath(a.path);
+        if (!meta || meta->variantGroup != groupId) continue;
+        if (!meta->variantGroupName.empty()) return meta->variantGroupName;
+        if (firstAssetName.empty()) firstAssetName = a.name;
+        if (meta->variantPrimary) primaryName = a.name;
+    }
+    if (!primaryName.empty()) return primaryName;
+    if (!firstAssetName.empty()) return firstAssetName;
+    return groupId;
+}
+
+static std::wstring TrimWide(const std::wstring& s) {
+    size_t b = 0;
+    while (b < s.size() && iswspace(s[b])) ++b;
+    size_t e = s.size();
+    while (e > b && iswspace(s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+static void SetVariantGroupDisplayName(const std::wstring& groupId, const std::wstring& name) {
+    if (groupId.empty()) return;
+    for (auto& kv : g_assetMetaMap) {
+        if (kv.second.variantGroup == groupId) kv.second.variantGroupName = name;
+    }
+}
+
+static bool RenameVariantGroup(const std::wstring& groupId, const std::wstring& name) {
+    if (groupId.empty() || name.empty()) return false;
+    SetVariantGroupDisplayName(groupId, name);
+    SaveAssetMeta();
+    return true;
+}
+
+static bool IsVariantGroupNameDuplicatedInCategory(const std::wstring& category, const std::wstring& name, const std::wstring& ignoreGroupId, const std::set<std::wstring>& ignoreAssetPaths) {
+    std::wstring key = ToLower(TrimWide(name));
+    if (key.empty()) return false;
+
+    std::set<std::wstring> checkedGroups;
+    for (const auto& a : g_assets) {
+        if (a.category != category) continue;
+
+        bool ignoreAssetName = (ignoreAssetPaths.count(a.path) > 0);
+        auto* meta = GetAssetMetaForPath(a.path);
+        if (!ignoreAssetName && meta && !ignoreGroupId.empty() && meta->variantGroup == ignoreGroupId) {
+            ignoreAssetName = true;
+        }
+        if (!ignoreAssetName && ToLower(TrimWide(a.name)) == key) return true;
+
+        if (!meta || meta->variantGroup.empty()) continue;
+        if (meta->variantGroup == ignoreGroupId) continue;
+        if (!checkedGroups.insert(meta->variantGroup).second) continue;
+
+        if (ToLower(TrimWide(GetVariantGroupDisplayName(meta->variantGroup))) == key) return true;
+    }
+    return false;
+}
+
+static std::vector<Asset*> GetVariantMembers(const std::wstring& groupId) {
+    std::vector<Asset*> members;
+    if (groupId.empty()) return members;
+    for (auto& a : g_assets) {
+        auto* meta = GetAssetMetaForPath(a.path);
+        if (!meta || meta->variantGroup != groupId) continue;
+        members.push_back(&a);
+    }
+    std::sort(members.begin(), members.end(), [](Asset* a, Asset* b) {
+        auto* ma = GetAssetMetaForPath(a->path);
+        auto* mb = GetAssetMetaForPath(b->path);
+        bool pa = ma && ma->variantPrimary;
+        bool pb = mb && mb->variantPrimary;
+        if (pa != pb) return pa > pb;
+        return a->name < b->name;
+    });
+    return members;
+}
+
+static bool IsVariantGroupCategoryCompatible(const std::wstring& groupId, const std::wstring& category) {
+    if (groupId.empty()) return false;
+    bool found = false;
+    for (const auto& a : g_assets) {
+        auto* meta = GetAssetMetaForPath(a.path);
+        if (!meta || meta->variantGroup != groupId) continue;
+        found = true;
+        if (a.category != category) return false;
+    }
+    return found;
+}
+
+static bool AssetHasVariants(const Asset& a) {
+    auto* meta = GetAssetMetaForPath(a.path);
+    if (!meta || meta->variantGroup.empty()) return false;
+    return GetVariantMembers(meta->variantGroup).size() > 1;
+}
+
+static std::wstring GetAssetDisplayNameForSort(Asset* a) {
+    if (!a) return L"";
+    auto* meta = GetAssetMetaForPath(a->path);
+    if (meta && !meta->variantGroup.empty()) {
+        return GetVariantGroupDisplayName(meta->variantGroup);
+    }
+    return a->name;
+}
+
+static void ReconcileVariantMeta() {
+    std::set<std::wstring> existing;
+    for (const auto& a : g_assets) existing.insert(a.path);
+
+    bool changed = false;
+    for (auto it = g_assetMetaMap.begin(); it != g_assetMetaMap.end(); ) {
+        bool hasFlags = it->second.favorite || it->second.fixedFrame || it->second.textStyle;
+        bool hasVariant = !it->second.variantGroup.empty();
+        if (existing.count(it->first) == 0 && (hasVariant || !hasFlags)) {
+            it = g_assetMetaMap.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+
+    std::map<std::wstring, std::vector<std::wstring>> groups;
+    for (const auto& kv : g_assetMetaMap) {
+        if (!kv.second.variantGroup.empty() && existing.count(kv.first) > 0) {
+            groups[kv.second.variantGroup].push_back(kv.first);
+        }
+    }
+
+    for (auto& kv : groups) {
+        auto& paths = kv.second;
+        bool hasPrimary = false;
+        std::wstring groupName;
+        for (const auto& p : paths) {
+            if (groupName.empty() && !g_assetMetaMap[p].variantGroupName.empty()) {
+                groupName = g_assetMetaMap[p].variantGroupName;
+            }
+            if (g_assetMetaMap[p].variantPrimary) {
+                if (!hasPrimary) hasPrimary = true;
+                else {
+                    g_assetMetaMap[p].variantPrimary = false;
+                    changed = true;
+                }
+            }
+        }
+        if (!hasPrimary) {
+            std::sort(paths.begin(), paths.end());
+            g_assetMetaMap[paths[0]].variantPrimary = true;
+            changed = true;
+        }
+        if (groupName.empty()) {
+            for (const auto& a : g_assets) {
+                if (std::find(paths.begin(), paths.end(), a.path) != paths.end()) {
+                    groupName = a.name;
+                    break;
+                }
+            }
+        }
+        for (const auto& p : paths) {
+            if (g_assetMetaMap[p].variantGroupName.empty() && !groupName.empty()) {
+                g_assetMetaMap[p].variantGroupName = groupName;
+                changed = true;
+            }
+        }
+    }
+
+    if (changed) SaveAssetMeta();
+}
+
+static bool SetVariantPrimary(const std::wstring& path) {
+    auto* meta = GetAssetMetaForPath(path);
+    if (!meta || meta->variantGroup.empty()) return false;
+    std::wstring group = meta->variantGroup;
+    for (auto& kv : g_assetMetaMap) {
+        if (kv.second.variantGroup == group) kv.second.variantPrimary = (kv.first == path);
+    }
+    SaveAssetMeta();
+    return true;
+}
+
+static bool CreateVariantGroupForAsset(const std::wstring& path, const std::wstring& groupName) {
+    AssetMetaFlags& meta = EnsureAssetMetaForPath(path);
+    if (meta.variantGroup.empty()) {
+        meta.variantGroup = MakeVariantGroupId();
+        meta.variantGroupName = groupName;
+        meta.variantName.clear();
+        meta.variantPrimary = true;
+    } else if (!groupName.empty()) {
+        SetVariantGroupDisplayName(meta.variantGroup, groupName);
+    }
+    if (meta.variantName.empty()) {
+        for (const auto& a : g_assets) if (a.path == path) { meta.variantName = a.name; break; }
+    }
+    SaveAssetMeta();
+    return true;
+}
+
+static bool AddAssetToVariantGroup(const std::wstring& path, const std::wstring& groupId) {
+    if (groupId.empty()) return false;
+    std::wstring category;
+    for (const auto& a : g_assets) {
+        if (a.path == path) { category = a.category; break; }
+    }
+    if (category.empty() || !IsVariantGroupCategoryCompatible(groupId, category)) return false;
+    AssetMetaFlags& meta = EnsureAssetMetaForPath(path);
+    meta.variantGroup = groupId;
+    meta.variantGroupName = GetVariantGroupDisplayName(groupId);
+    if (meta.variantName.empty()) {
+        for (const auto& a : g_assets) if (a.path == path) { meta.variantName = a.name; break; }
+    }
+    bool hasPrimary = false;
+    for (const auto& kv : g_assetMetaMap) {
+        if (kv.second.variantGroup == groupId && kv.second.variantPrimary) { hasPrimary = true; break; }
+    }
+    if (!hasPrimary) meta.variantPrimary = true;
+    SaveAssetMeta();
+    return true;
+}
+
+static bool RemoveAssetFromVariantGroup(const std::wstring& path) {
+    auto* meta = GetAssetMetaForPath(path);
+    if (!meta || meta->variantGroup.empty()) return false;
+    meta->variantGroup.clear();
+    meta->variantGroupName.clear();
+    meta->variantName.clear();
+    meta->variantPrimary = false;
+    SaveAssetMeta();
+    ReconcileVariantMeta();
+    return true;
+}
+
+static void MoveAssetMetaPath(const std::wstring& oldPath, const std::wstring& newPath) {
+    if (oldPath.empty() || oldPath == newPath) return;
+    auto it = g_assetMetaMap.find(oldPath);
+    if (it == g_assetMetaMap.end()) return;
+    AssetMetaFlags flags = it->second;
+    g_assetMetaMap.erase(it);
+    g_assetMetaMap[newPath] = flags;
+    SyncSetsFromMetaMap();
+    SaveAssetMeta();
 }
 
 static void LoadLegacyMetaAndMigrate() {
@@ -2334,12 +2666,35 @@ static std::wstring GetTempPreviewPath(const std::wstring& ext) {
     return std::wstring(tempPath) + L"myasset_temp" + ext;
 }
 
+static bool IsUncategorizedCategory(const std::wstring& category) {
+    return _wcsicmp(category.c_str(), L"Main") == 0;
+}
+
+static std::wstring GetCategoryDisplayName(const std::wstring& category) {
+    if (_wcsicmp(category.c_str(), L"ALL") == 0) return L"すべて (ALL)";
+    if (IsUncategorizedCategory(category)) return L"未分類";
+    return category;
+}
+
+static std::wstring CategoryFromDisplayName(const std::wstring& displayName) {
+    if (TrimWide(displayName).empty()) return L"Main";
+    if (_wcsicmp(displayName.c_str(), L"すべて (ALL)") == 0) return L"ALL";
+    if (_wcsicmp(displayName.c_str(), L"未分類") == 0) return L"Main";
+    return displayName;
+}
+
+static bool IsReservedCategoryDisplayName(const std::wstring& displayName) {
+    return _wcsicmp(TrimWide(displayName).c_str(), L"未分類") == 0 ||
+           _wcsicmp(TrimWide(displayName).c_str(), L"すべて (ALL)") == 0 ||
+           _wcsicmp(TrimWide(displayName).c_str(), L"ALL") == 0;
+}
+
 static std::wstring GetCategoryDirPath(const std::wstring& category) {
     InitBaseDir();
     if (_wcsicmp(category.c_str(), L"ALL") == 0) return g_baseDir;
+    if (IsUncategorizedCategory(category)) return g_baseDir;
     std::wstring dir = g_baseDir + L"\\" + category;
     if (PathFileExistsW(dir.c_str())) return dir;
-    if (_wcsicmp(category.c_str(), L"Main") == 0) return g_baseDir;
     return dir;
 }
 
@@ -2368,6 +2723,14 @@ static std::wstring GetAssetOrderKey(const std::wstring& category, const std::ws
     }
     size_t p = assetPath.find_last_of(L"\\/");
     return (p == std::wstring::npos) ? assetPath : assetPath.substr(p + 1);
+}
+
+static std::wstring GetAssetDisplayOrderKey(const std::wstring& category, const std::wstring& assetPath) {
+    auto* meta = GetAssetMetaForPath(assetPath);
+    if (meta && !meta->variantGroup.empty()) {
+        return L"variant:" + GetVariantGroupDisplayName(meta->variantGroup);
+    }
+    return GetAssetOrderKey(category, assetPath);
 }
 
 static bool ParseOrderJson(const std::string& text, std::vector<std::wstring>& outOrder) {
@@ -2448,19 +2811,30 @@ static void ReconcileCustomOrderForCategory(const std::wstring& category) {
     std::vector<std::wstring> existing;
     existing.reserve(g_assets.size());
     std::set<std::wstring> existingSet;
+    std::map<std::wstring, std::wstring> legacyPathKeyToDisplayKey;
     for (const auto& a : g_assets) {
         if (category != L"ALL" && a.category != category) continue;
-        std::wstring key = GetAssetOrderKey(category, a.path);
-        existing.push_back(key);
-        existingSet.insert(key);
+        std::wstring pathKey = GetAssetOrderKey(category, a.path);
+        std::wstring key = GetAssetDisplayOrderKey(category, a.path);
+        legacyPathKeyToDisplayKey[pathKey] = key;
+        auto* meta = GetAssetMetaForPath(a.path);
+        if (meta && !meta->variantGroup.empty()) {
+            legacyPathKeyToDisplayKey[L"variant:" + meta->variantGroup] = key;
+        }
+        if (existingSet.insert(key).second) existing.push_back(key);
     }
 
     std::vector<std::wstring> nextOrder;
     nextOrder.reserve(existing.size());
     std::set<std::wstring> used;
     for (const auto& k : order) {
-        if (existingSet.count(k) == 0) continue;
-        if (used.insert(k).second) nextOrder.push_back(k);
+        std::wstring key = k;
+        if (existingSet.count(key) == 0) {
+            auto legacyIt = legacyPathKeyToDisplayKey.find(k);
+            if (legacyIt != legacyPathKeyToDisplayKey.end()) key = legacyIt->second;
+        }
+        if (existingSet.count(key) == 0) continue;
+        if (used.insert(key).second) nextOrder.push_back(key);
     }
     for (const auto& k : existing) {
         if (used.insert(k).second) nextOrder.push_back(k);
@@ -2487,7 +2861,6 @@ static bool CanStartCustomReorder() {
     if (g_currentCategory.empty()) return false;
     if (!g_searchQuery.empty()) return false;
     if (g_enableTextStyle && g_assetViewTab != 0) return false;
-    if (g_hideTextStyleInMainList) return false;
     return true;
 }
 
@@ -2709,7 +3082,6 @@ static void LayerApiCompareProc(void* param, EDIT_SECTION_OUT_SAFE* edit) {
 }
 
 static void RunLayerApiCompareDebug() {
-    // 追加直後は選択状態が変わりやすいため、事前保持した配列で比較する。
     if (!g_enableGroupDebugDump) return;
     if (g_pendingLayerApiCompareObjs.empty()) {
         AppendGroupDebugLine("  layer-api compare skipped: pending object list empty");
@@ -2754,8 +3126,6 @@ static void CollectApiLayersForPendingAddProc(void* param, EDIT_SECTION_OUT_SAFE
 }
 
 static void ProcessPendingAddAssetRequestByApi() {
-    // call_edit_section内で重い処理を続けると固まりやすいため、
-    // OnAddAssetでスナップショット化→ここで非同期に本処理を行う。
     if (g_pendingAddObjSnapshots.empty()) return;
 
     std::vector<PendingAddObjSnapshot> snaps;
@@ -2791,7 +3161,7 @@ static void ProcessPendingAddAssetRequestByApi() {
     g_addDialogRangeValid = false;
     g_addDialogRangeStart = 0;
     g_addDialogRangeEnd = 0;
-    // GIF書き出し用の選択範囲もここで再構築しておく。
+    // GIF書き出し用の選択範囲もここで再構築。
     int rStart = INT_MAX, rEnd = INT_MIN;
     bool hasRange = false;
     for (size_t i = 0; i < snaps.size(); ++i) {
@@ -3642,6 +4012,7 @@ static LRESULT CALLBACK DarkMsgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     switch (msg) {
     case WM_NCCALCSIZE: if(wp) return 0; return DefWindowProc(hwnd, msg, wp, lp);
     case WM_NCACTIVATE: return TRUE;
+    case WM_ERASEBKGND: return 1;
     case WM_PAINT: { PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); RECT rc; GetClientRect(hwnd, &rc); FillRect(hdc, &rc, g_hBrBg); DrawTitleBar(hdc, rc.right, g_msgTitle.c_str()); RECT rcText = {20, TITLE_H + 20, rc.right - 20, rc.bottom - 50}; SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontUI); DrawTextW(hdc, g_msgText.c_str(), -1, &rcText, DT_LEFT | DT_WORDBREAK); DrawWindowBorder(hwnd); EndPaint(hwnd, &ps); return 0; }
     case WM_NCHITTEST: { 
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; ScreenToClient(hwnd, &pt); 
@@ -3657,16 +4028,17 @@ static LRESULT CALLBACK DarkMsgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
 }
 
 void RegisterCustomDialogs() { 
-    WNDCLASSW wc = {0}; wc.lpfnWndProc = DarkMsgDlgProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAsset_Msg"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = g_hBrBg; RegisterClassW(&wc); 
+    WNDCLASSW wc = {0}; wc.lpfnWndProc = DarkMsgDlgProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAsset_Msg"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH); RegisterClassW(&wc); 
 }
 
 int ShowDarkMsg(HWND parent, LPCWSTR text, LPCWSTR title, UINT type) {
     g_msgTitle = title; g_msgText = text; g_msgResult = IDNO; int w = 400, h = 220; int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN); 
-    HWND hMsg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"MyAsset_Msg", title, WS_POPUP | WS_VISIBLE | WS_THICKFRAME, (sw-w)/2, (sh-h)/2, w, h, parent, NULL, g_hInst, NULL);
+    HWND hMsg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"MyAsset_Msg", title, WS_POPUP | WS_THICKFRAME, (sw-w)/2, (sh-h)/2, w, h, parent, NULL, g_hInst, NULL);
     g_hInfoWnd = hMsg;
     int btnY = h - 45; 
     if (type == MB_YESNO) { CreateWindowW(L"BUTTON", L"はい", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, w - 180, btnY, 80, 26, hMsg, (HMENU)ID_BTN_MSG_YES, g_hInst, NULL); CreateWindowW(L"BUTTON", L"いいえ", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, w - 90, btnY, 80, 26, hMsg, (HMENU)ID_BTN_MSG_NO, g_hInst, NULL); } 
     else { CreateWindowW(L"BUTTON", L"OK", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, w - 100, btnY, 80, 26, hMsg, (HMENU)ID_BTN_MSG_OK, g_hInst, NULL); }
+    ShowWindowPrepared(hMsg);
     EnableWindow(parent, FALSE); 
     MSG msg; 
     while (IsWindow(hMsg)) { 
@@ -3675,6 +4047,103 @@ int ShowDarkMsg(HWND parent, LPCWSTR text, LPCWSTR title, UINT type) {
         TranslateMessage(&msg); DispatchMessage(&msg); 
     }
     EnableWindow(parent, TRUE); SetForegroundWindow(parent); g_hInfoWnd = nullptr; return g_msgResult;
+}
+
+static LRESULT CALLBACK DarkInputDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_NCCALCSIZE: if (wp) return 0; return DefWindowProc(hwnd, msg, wp, lp);
+    case WM_NCACTIVATE: return TRUE;
+    case WM_ERASEBKGND: return 1;
+    case WM_CREATE: {
+        HWND hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", g_inputText.c_str(), WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 20, TITLE_H + 72, 360, 24, hwnd, (HMENU)IDC_EDIT_INPUT, g_hInst, NULL);
+        SendMessageW(hEdit, WM_SETFONT, (WPARAM)g_hFontUI, 0);
+        SetWindowTheme(hEdit, L"", L"");
+        CreateWindowW(L"BUTTON", L"OK", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 210, 138, 80, 26, hwnd, (HMENU)ID_BTN_MSG_OK, g_hInst, NULL);
+        CreateWindowW(L"BUTTON", L"キャンセル", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 300, 138, 80, 26, hwnd, (HMENU)ID_BTN_MSG_NO, g_hInst, NULL);
+        SetFocus(hEdit);
+        SendMessageW(hEdit, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); RECT rc; GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_hBrBg);
+        DrawTitleBar(hdc, rc.right, g_inputTitle.c_str());
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, COL_TEXT);
+        SelectObject(hdc, g_hFontUI);
+        RECT rt = {20, TITLE_H + 24, rc.right - 20, TITLE_H + 60};
+        DrawTextW(hdc, g_inputLabel.c_str(), -1, &rt, DT_LEFT | DT_WORDBREAK);
+        DrawWindowBorder(hwnd);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_NCHITTEST: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; ScreenToClient(hwnd, &pt);
+        RECT rc; GetClientRect(hwnd, &rc);
+        if (pt.y < TITLE_H && pt.x > rc.right - 40) return HTCLIENT;
+        if (pt.y < TITLE_H) return HTCAPTION;
+        return HTCLIENT;
+    }
+    case WM_DRAWITEM: DrawDarkButton((LPDRAWITEMSTRUCT)lp); return TRUE;
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if (id == ID_BTN_MSG_OK || id == IDOK) {
+            wchar_t buf[512] = {};
+            GetDlgItemTextW(hwnd, IDC_EDIT_INPUT, buf, 512);
+            g_inputText = buf;
+            g_inputResult = IDOK;
+            DestroyWindow(hwnd);
+        } else if (id == ID_BTN_MSG_NO || id == IDCANCEL) {
+            g_inputResult = IDCANCEL;
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; RECT rc; GetClientRect(hwnd, &rc);
+        if (pt.y < TITLE_H && pt.x > rc.right - 40) { g_inputResult = IDCANCEL; DestroyWindow(hwnd); }
+        return 0;
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = (HDC)wp;
+        SetTextColor(hdc, COL_TEXT);
+        SetBkColor(hdc, COL_INPUT_BG);
+        return (LRESULT)g_hBrInputBg;
+    }
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+bool ShowDarkInput(HWND parent, LPCWSTR title, LPCWSTR label, const std::wstring& initialText, std::wstring& outText) {
+    g_inputTitle = title ? title : L"入力";
+    g_inputLabel = label ? label : L"";
+    g_inputText = initialText;
+    g_inputResult = IDCANCEL;
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = DarkInputDlgProc;
+    wc.hInstance = g_hInst;
+    wc.lpszClassName = L"MyAsset_Input";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
+    RegisterClassW(&wc);
+    int w = 400, h = 180;
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"MyAsset_Input", g_inputTitle.c_str(), WS_POPUP | WS_THICKFRAME, (sw - w) / 2, (sh - h) / 2, w, h, parent, NULL, g_hInst, NULL);
+    if (!hDlg) return false;
+    ShowWindowPrepared(hDlg);
+    EnableWindow(parent, FALSE);
+    MSG msg;
+    while (IsWindow(hDlg)) {
+        BOOL res = GetMessage(&msg, NULL, 0, 0);
+        if (res == 0 || res == -1) { DestroyWindow(hDlg); if (res == 0) PostQuitMessage(msg.wParam); break; }
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+    if (g_inputResult != IDOK) return false;
+    outText = g_inputText;
+    return true;
 }
 
 static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -4165,7 +4634,7 @@ void OpenSettings() {
     wc.lpfnWndProc = SettingsDlgProc;
     wc.hInstance = g_hInst;
     wc.lpszClassName = L"MyAsset_Settings";
-    wc.hbrBackground = g_hBrBg;
+    wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
     RegisterClassW(&wc);
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     g_hSettingDlg = CreateWindowExW(
@@ -4176,8 +4645,7 @@ void OpenSettings() {
         (sw-500)/2, (sh-560)/2, 500, 560,
         g_hwnd, nullptr, g_hInst, nullptr);
     if (g_hSettingDlg && IsWindow(g_hSettingDlg)) {
-        RedrawWindow(g_hSettingDlg, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
-        ShowWindow(g_hSettingDlg, SW_SHOW);
+        ShowWindowPrepared(g_hSettingDlg);
     }
 }
 
@@ -4335,7 +4803,7 @@ static void OpenTextStyleQuickDialog(HWND parent) {
     wc.lpfnWndProc = TextStyleQuickDlgProc;
     wc.hInstance = g_hInst;
     wc.lpszClassName = L"MyAsset_TextStyleQuick";
-    wc.hbrBackground = g_hBrBg;
+    wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
     RegisterClassW(&wc);
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     g_hTextStyleQuickDlg = CreateWindowExW(
@@ -4346,8 +4814,7 @@ static void OpenTextStyleQuickDialog(HWND parent) {
         (sw-400)/2, (sh-560)/2, 400, 560,
         parent ? parent : g_hwnd, nullptr, g_hInst, nullptr);
     if (g_hTextStyleQuickDlg && IsWindow(g_hTextStyleQuickDlg)) {
-        RedrawWindow(g_hTextStyleQuickDlg, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
-        ShowWindow(g_hTextStyleQuickDlg, SW_SHOW);
+        ShowWindowPrepared(g_hTextStyleQuickDlg);
     }
 }
 
@@ -4412,11 +4879,41 @@ void UpdateDisplayList() {
     g_displayAssets.clear(); 
     g_selectedIndex = -1; g_hoverIndex = -1;
     std::wstring sl = ToLower(g_searchQuery); 
+    std::vector<Asset*> candidates;
     for (auto& a : g_assets) { 
         if (g_enableTextStyle && g_assetViewTab == 1 && !a.isTextStyle) continue;
         if (g_enableTextStyle && g_assetViewTab == 0 && g_hideTextStyleInMainList && a.isTextStyle) continue;
-        if ((g_currentCategory == L"ALL" || a.category == g_currentCategory) && (sl.empty() || ToLower(a.name).find(sl) != std::wstring::npos)) 
-            g_displayAssets.push_back(&a); 
+        if (g_currentCategory != L"ALL" && a.category != g_currentCategory) continue;
+
+        bool match = sl.empty() || ToLower(a.name).find(sl) != std::wstring::npos;
+        if (!match) {
+            if (auto* meta = GetAssetMetaForPath(a.path)) {
+                match = ToLower(meta->variantName).find(sl) != std::wstring::npos;
+                if (!match && !meta->variantGroup.empty()) {
+                    match = ToLower(GetVariantGroupDisplayName(meta->variantGroup)).find(sl) != std::wstring::npos;
+                }
+            }
+        }
+        if (match) candidates.push_back(&a);
+    }
+
+    std::map<std::wstring, std::vector<Asset*>> variantCandidates;
+    for (auto* a : candidates) {
+        auto* meta = GetAssetMetaForPath(a->path);
+        if (!meta || meta->variantGroup.empty()) {
+            g_displayAssets.push_back(a);
+            continue;
+        }
+        variantCandidates[meta->variantGroup].push_back(a);
+    }
+    for (auto& kv : variantCandidates) {
+        Asset* picked = nullptr;
+        for (auto* a : kv.second) {
+            auto* meta = GetAssetMetaForPath(a->path);
+            if (meta && meta->variantPrimary) { picked = a; break; }
+        }
+        if (!picked && !kv.second.empty()) picked = kv.second[0];
+        if (picked) g_displayAssets.push_back(picked);
     }
 
     std::map<std::wstring, int> customRank;
@@ -4431,24 +4928,24 @@ void UpdateDisplayList() {
     std::sort(g_displayAssets.begin(), g_displayAssets.end(), [&customRank](Asset* a, Asset* b) {
         if (g_sortMode == 1) {
             if (a->isFavorite != b->isFavorite) return a->isFavorite > b->isFavorite;
-            return a->name < b->name;
+            return GetAssetDisplayNameForSort(a) < GetAssetDisplayNameForSort(b);
         }
         if (g_sortMode == 2) {
             if (a->category != b->category) return a->category < b->category;
-            return a->name < b->name;
+            return GetAssetDisplayNameForSort(a) < GetAssetDisplayNameForSort(b);
         }
         if (g_sortMode == 3) {
-            std::wstring ka = GetAssetOrderKey(g_currentCategory, a->path);
-            std::wstring kb = GetAssetOrderKey(g_currentCategory, b->path);
+            std::wstring ka = GetAssetDisplayOrderKey(g_currentCategory, a->path);
+            std::wstring kb = GetAssetDisplayOrderKey(g_currentCategory, b->path);
             int ra = INT_MAX, rb = INT_MAX;
             auto ia = customRank.find(ka);
             if (ia != customRank.end()) ra = ia->second;
             auto ib = customRank.find(kb);
             if (ib != customRank.end()) rb = ib->second;
             if (ra != rb) return ra < rb;
-            return a->name < b->name;
+            return GetAssetDisplayNameForSort(a) < GetAssetDisplayNameForSort(b);
         }
-        return a->name < b->name;
+        return GetAssetDisplayNameForSort(a) < GetAssetDisplayNameForSort(b);
     });
     if (g_hwnd) {
         UpdateScrollBar(g_hwnd);
@@ -4463,7 +4960,7 @@ static void SaveCurrentDisplayOrderForCategory() {
     for (auto* a : g_displayAssets) {
         if (!a) continue;
         if (g_currentCategory != L"ALL" && a->category != g_currentCategory) continue;
-        order.push_back(GetAssetOrderKey(g_currentCategory, a->path));
+        order.push_back(GetAssetDisplayOrderKey(g_currentCategory, a->path));
     }
     g_customOrderByCategory[g_currentCategory] = order;
     SaveCustomOrderForCategory(g_currentCategory, order);
@@ -4478,19 +4975,26 @@ void RefreshAssets(bool reloadFav) {
     if (!g_lastTempPath.empty()) { DeleteFileW(g_lastTempPath.c_str()); g_lastTempPath = L""; }
     g_customOrderByCategory.clear();
     ClearAssets(); ScanDirectory(g_baseDir, L"Main"); 
+    ReconcileVariantMeta();
     g_categories.clear(); std::set<std::wstring> cs; for(auto& a : g_assets) cs.insert(a.category);
     ReconcileCustomOrderForCategory(L"ALL");
     for (const auto& c : cs) ReconcileCustomOrderForCategory(c);
     g_categories.push_back(L"ALL");
-    for(auto& c : cs) g_categories.push_back(c);
+    if (cs.count(L"Main") > 0) g_categories.push_back(L"Main");
+    for(auto& c : cs) {
+        if (IsUncategorizedCategory(c)) continue;
+        g_categories.push_back(c);
+    }
 
     if (std::find(g_categories.begin(), g_categories.end(), prevCategory) != g_categories.end()) g_currentCategory = prevCategory;
     else g_currentCategory = L"ALL";
 
     if(g_hCombo) {
         SendMessage(g_hCombo, CB_RESETCONTENT, 0, 0);
-        SendMessage(g_hCombo, CB_ADDSTRING, 0, (LPARAM)L"すべて (ALL)");
-        for(auto& c : cs) SendMessage(g_hCombo, CB_ADDSTRING, 0, (LPARAM)c.c_str());
+        for (const auto& c : g_categories) {
+            std::wstring label = GetCategoryDisplayName(c);
+            SendMessage(g_hCombo, CB_ADDSTRING, 0, (LPARAM)label.c_str());
+        }
         int selIndex = 0;
         for (int i = 0; i < (int)g_categories.size(); ++i) {
             if (g_categories[i] == g_currentCategory) { selIndex = i; break; }
@@ -4705,6 +5209,7 @@ static LRESULT CALLBACK GifGuideDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     switch (msg) {
     case WM_NCCALCSIZE: if (wp) return 0; return DefWindowProc(hwnd, msg, wp, lp);
     case WM_NCACTIVATE: return TRUE;
+    case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
         RECT rc; GetClientRect(hwnd, &rc);
@@ -4775,7 +5280,7 @@ static bool ShowGifExportGuideDialog(HWND parent) {
     wc.hInstance = g_hInst;
     wc.lpszClassName = L"MyAsset_GifGuide";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = g_hBrBg;
+    wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
     RegisterClassW(&wc);
 
     int w = 500, h = 270;
@@ -4784,7 +5289,7 @@ static bool ShowGifExportGuideDialog(HWND parent) {
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         L"MyAsset_GifGuide",
         L"保存先の指定",
-        WS_POPUP | WS_VISIBLE | WS_THICKFRAME,
+        WS_POPUP | WS_THICKFRAME,
         (sw - w) / 2, (sh - h) / 2, w, h,
         parent, nullptr, g_hInst, nullptr);
     if (!hDlg) return false;
@@ -4797,6 +5302,7 @@ static bool ShowGifExportGuideDialog(HWND parent) {
                   w - 100, h - 55, 80, 28, hDlg, (HMENU)ID_BTN_GUIDE_CANCEL, g_hInst, NULL);
     SendMessageW(hChk, WM_SETFONT, (WPARAM)g_hFontUI, 0);
     SetWindowTheme(hChk, L"", L"");
+    ShowWindowPrepared(hDlg);
 
     g_guideResult = IDCANCEL;
     g_guideHideNext = false;
@@ -4828,6 +5334,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_NCCALCSIZE: if(wp) return 0; return DefWindowProc(hwnd, msg, wp, lp); 
     case WM_NCACTIVATE: return TRUE;
+    case WM_ERASEBKGND: return 1;
     case WM_CREATE: {
         g_addGifHintTimerStarted = false;
         g_addDlgMouseTracking = false;
@@ -4837,7 +5344,12 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         h = CreateWindowW(L"EDIT", L"", WS_VISIBLE|WS_CHILD|WS_BORDER|ES_AUTOHSCROLL, 75, TITLE_H+12, 260, 24, hwnd, (HMENU)IDC_EDIT_NAME, g_hInst, NULL); SendMessageW(h, WM_SETFONT, (WPARAM)g_hFontUI, 0);
         HWND hc = CreateWindowW(L"COMBOBOX", L"User", WS_VISIBLE|WS_CHILD|WS_VSCROLL|CBS_DROPDOWN, 75, TITLE_H+47, 260, 200, hwnd, (HMENU)IDC_COMBO_CAT, g_hInst, NULL); SendMessageW(hc, WM_SETFONT, (WPARAM)g_hFontUI, 0);
         HWND hcat = CreateWindowW(L"STATIC", L"カテゴリ:", WS_VISIBLE|WS_CHILD, 15, TITLE_H+50, 60, 20, hwnd, NULL, g_hInst, NULL); SendMessageW(hcat, WM_SETFONT, (WPARAM)g_hFontUI, 0);
-        for(const auto& c : g_categories) if(c != L"ALL") SendMessage(hc, CB_ADDSTRING, 0, (LPARAM)c.c_str());
+        for(const auto& c : g_categories) {
+            if(c == L"ALL") continue;
+            if (IsUncategorizedCategory(c)) continue;
+            std::wstring label = GetCategoryDisplayName(c);
+            SendMessage(hc, CB_ADDSTRING, 0, (LPARAM)label.c_str());
+        }
         HWND hCapTitle = CreateWindowW(L"STATIC", L"キャプチャ", WS_VISIBLE|WS_CHILD, 75, TITLE_H+78, 120, 18, hwnd, NULL, g_hInst, NULL);
         SendMessageW(hCapTitle, WM_SETFONT, (WPARAM)g_hFontUI, 0);
         CreateWindowW(L"BUTTON", L"キャプチャ", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 75, TITLE_H+96, 100, 24, hwnd, (HMENU)ID_BTN_SNIP, g_hInst, NULL);
@@ -4859,10 +5371,16 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowW(L"BUTTON", L"キャンセル", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 190, 428, 100, 30, hwnd, (HMENU)ID_BTN_CANCEL, g_hInst, NULL);
         if (!g_editOrgPath.empty()) {
             SetDlgItemTextW(hwnd, IDC_EDIT_NAME, g_editName.c_str());
-            SetDlgItemTextW(hwnd, IDC_COMBO_CAT, g_editCat.c_str());
+            std::wstring label = IsUncategorizedCategory(g_editCat) ? L"" : GetCategoryDisplayName(g_editCat);
+            SetDlgItemTextW(hwnd, IDC_COMBO_CAT, label.c_str());
+            if (!label.empty()) {
+                LRESULT catIdx = SendMessageW(hc, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)label.c_str());
+                if (catIdx != CB_ERR) SendMessageW(hc, CB_SETCURSEL, (WPARAM)catIdx, 0);
+            }
         } else if (g_addDialogFromMyAssetAdd) {
-            if (!g_currentCategory.empty() && g_currentCategory != L"ALL") {
-                LRESULT catIdx = SendMessageW(hc, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)g_currentCategory.c_str());
+            if (!g_currentCategory.empty() && g_currentCategory != L"ALL" && !IsUncategorizedCategory(g_currentCategory)) {
+                std::wstring label = GetCategoryDisplayName(g_currentCategory);
+                LRESULT catIdx = SendMessageW(hc, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)label.c_str());
                 if (catIdx != CB_ERR) {
                     SendMessageW(hc, CB_SETCURSEL, (WPARAM)catIdx, 0);
                 }
@@ -5027,8 +5545,14 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wcslen(nb) == 0) { ShowDarkMsg(hwnd, L"名前を入力してください", L"確認", MB_OK); return 0; }
             
             InitBaseDir(); 
-            std::wstring sd = g_baseDir + L"\\" + cb; 
-            CreateDirectoryW(sd.c_str(), nullptr);
+            std::wstring catInput = TrimWide(cb);
+            if (!catInput.empty() && IsReservedCategoryDisplayName(catInput)) {
+                ShowDarkMsg(hwnd, L"そのカテゴリ名は使えません。別の名前を指定してください。", L"Info", MB_OK);
+                return 0;
+            }
+            std::wstring catInternal = CategoryFromDisplayName(catInput);
+            std::wstring sd = GetCategoryDirPath(catInternal);
+            if (!IsUncategorizedCategory(catInternal)) CreateDirectoryW(sd.c_str(), nullptr);
             
             std::wstring fn = g_editOrgPath.empty() ? GetUniqueFileName(sd, nb) : nb;
             std::wstring destBase = sd + L"\\" + fn;
@@ -5042,6 +5566,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 std::wstring newPathLower = ToLower(sp);
                 if (oldPathLower != newPathLower) {
                     MoveFileW(g_editOrgPath.c_str(), sp.c_str());
+                    MoveAssetMetaPath(g_editOrgPath, sp);
                 }
             } else {
                 WriteFileContent(sp, g_tempAliasData);
@@ -5207,8 +5732,318 @@ void OpenAddDialog(const std::string& data, bool isEdit) {
     }
     LoadWindowConfig(); int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     int x = (g_dlgX == -1) ? (sw - 360) / 2 : g_dlgX; int y = (g_dlgY == -1) ? (sh - 490) / 2 : g_dlgY;
-    WNDCLASSW wc = {0}; wc.lpfnWndProc = AddDlgProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAsset_Add"; wc.hbrBackground = g_hBrBg; RegisterClassW(&wc); 
-    g_hDlg = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"MyAsset_Add", L"アセット", WS_POPUP|WS_VISIBLE|WS_THICKFRAME, x, y, 360, 490, g_hwnd, nullptr, g_hInst, nullptr); 
+    WNDCLASSW wc = {0}; wc.lpfnWndProc = AddDlgProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAsset_Add"; wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH); RegisterClassW(&wc); 
+    g_hDlg = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"MyAsset_Add", L"アセット", WS_POPUP|WS_THICKFRAME, x, y, 360, 490, g_hwnd, nullptr, g_hInst, nullptr); 
+    if (g_hDlg && IsWindow(g_hDlg)) {
+        ShowWindowPrepared(g_hDlg);
+        if (g_addDialogFromMyAssetAdd && !isEdit) SetFocus(GetDlgItem(g_hDlg, IDC_EDIT_NAME));
+    }
+}
+
+static RECT GetAssetThumbRectForItem(int itemX, int itemY, int cw, int itemH) {
+    int thumbW = GetThumbWScaled();
+    int thumbH = GetThumbHScaled();
+    int imgX = g_previewThumbOnly ? (itemX + (cw - thumbW) / 2) : (itemX + 7);
+    int imgY = itemY + (itemH - thumbH) / 2;
+    RECT rc = { imgX, imgY, imgX + thumbW, imgY + thumbH };
+    return rc;
+}
+
+static RECT GetVariantButtonRect(const RECT& thumbRect) {
+    RECT rc = { thumbRect.right - 22, thumbRect.top, thumbRect.right, thumbRect.top + 22 };
+    return rc;
+}
+
+static bool AdvanceAssetPreviewFrame(Asset* p, double elapsedMs) {
+    if (!p || p->frameCount <= 1) return false;
+    double speedScale = (double)(std::max)(1, g_gifSpeedPercent) / 100.0;
+    p->previewCarryMs += elapsedMs * speedScale;
+
+    UINT cycleMs = p->previewCycleMs;
+    if (cycleMs == 0) {
+        unsigned long long cycleSum = 0;
+        if (p->frameDelays) {
+            for (UINT fi = 0; fi < p->frameCount; ++fi) {
+                cycleSum += (unsigned long long)(std::max)(1u, p->frameDelays[fi]);
+            }
+        } else {
+            cycleSum = (unsigned long long)p->frameCount * 100ULL;
+        }
+        if (cycleSum == 0) cycleSum = (unsigned long long)p->frameCount * 100ULL;
+        p->previewCycleMs = (cycleSum > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (UINT)cycleSum;
+        cycleMs = p->previewCycleMs;
+    }
+
+    double cycle = (double)(std::max)(1u, cycleMs);
+    if (p->previewCarryMs >= cycle * 8.0) {
+        p->previewCarryMs = std::fmod(p->previewCarryMs, cycle);
+    }
+    double t = std::fmod(p->previewCarryMs, cycle);
+    if (t < 0.0) t += cycle;
+
+    UINT acc = 0;
+    int targetFrame = p->currentFrame;
+    for (UINT fi = 0; fi < p->frameCount; ++fi) {
+        UINT delayMs = p->frameDelays ? (std::max)(1u, p->frameDelays[fi]) : 100u;
+        UINT nextAcc = acc + delayMs;
+        if (t < (double)nextAcc) {
+            targetFrame = (int)fi;
+            break;
+        }
+        acc = nextAcc;
+    }
+    if (targetFrame == p->currentFrame) return false;
+    p->currentFrame = targetFrame;
+    return true;
+}
+
+static void ResetAssetPreviewPlayback(Asset* p) {
+    if (!p) return;
+    p->currentFrame = 0;
+    p->previewCarryMs = 0.0;
+}
+
+static void DrawVariantPopupContent(HDC hdc, const RECT& rc, int cellW, int cellH, int pad) {
+    FillRect(hdc, &rc, g_hBrBg);
+    HBRUSH brBorder = CreateSolidBrush(COL_BORDER);
+    FrameRect(hdc, &rc, brBorder);
+    DeleteObject(brBorder);
+
+    Graphics graphics(hdc);
+    int cols = (std::max)(1, ((int)rc.right - pad) / cellW);
+    for (int i = 0; i < (int)g_variantPopupAssets.size(); ++i) {
+        Asset* a = g_variantPopupAssets[(size_t)i];
+        if (!a) continue;
+        int col = i % cols;
+        int row = i / cols;
+        RECT cell = {
+            pad + col * cellW,
+            pad + row * cellH,
+            pad + col * cellW + cellW - 8,
+            pad + row * cellH + cellH - 8
+        };
+        auto* meta = GetAssetMetaForPath(a->path);
+        HBRUSH brCell = CreateSolidBrush((meta && meta->variantPrimary) ? COL_ITEM_SEL : COL_ITEM_BG);
+        FillRect(hdc, &cell, brCell);
+        DeleteObject(brCell);
+        if (a->pImage) {
+            if (a->frameCount > 1) {
+                GUID gt = FrameDimensionTime;
+                a->pImage->SelectActiveFrame(&gt, a->currentFrame);
+            }
+            UINT iw = a->pImage->GetWidth();
+            UINT ih = a->pImage->GetHeight();
+            float targetW = (float)(cell.right - cell.left);
+            float targetH = (float)(cell.bottom - cell.top);
+            float thumbRatio = targetW / targetH;
+            float imgRatio = (float)iw / (float)ih;
+            float srcX = 0, srcY = 0, srcW = (float)iw, srcH = (float)ih;
+            if (imgRatio > thumbRatio) {
+                srcW = ih * thumbRatio;
+                srcX = (iw - srcW) / 2.0f;
+            } else {
+                srcH = iw / thumbRatio;
+                srcY = (ih - srcH) / 2.0f;
+            }
+            graphics.DrawImage(
+                a->pImage,
+                Rect(cell.left, cell.top, cell.right - cell.left, cell.bottom - cell.top),
+                (INT)srcX, (INT)srcY, (INT)srcW, (INT)srcH,
+                UnitPixel);
+        }
+    }
+}
+
+static LRESULT CALLBACK VariantPopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_NCHITTEST:
+        return HTCLIENT;
+    case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE) DestroyWindow(hwnd);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_TIMER:
+        if (wp == ID_TIMER_VARIANT_POPUP) {
+            ULONGLONG now = GetTickCount64();
+            UINT tickMs = GetPreviewAllTickMs();
+            double elapsedMs = (g_variantPopupLastTick == 0) ? (double)tickMs : (double)(now - g_variantPopupLastTick);
+            if (elapsedMs < 0.0) elapsedMs = (double)tickMs;
+            g_variantPopupLastTick = now;
+
+            bool anyAnimated = false;
+            bool anyChanged = false;
+            for (auto* a : g_variantPopupAssets) {
+                if (!a || a->frameCount <= 1) continue;
+                anyAnimated = true;
+                if (AdvanceAssetPreviewFrame(a, elapsedMs)) anyChanged = true;
+            }
+            if (anyChanged) InvalidateRect(hwnd, NULL, FALSE);
+            if (anyAnimated) SetTimer(hwnd, ID_TIMER_VARIANT_POPUP, tickMs, NULL);
+            else KillTimer(hwnd, ID_TIMER_VARIANT_POPUP);
+            return 0;
+        }
+        break;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+        if (w > 0 && h > 0) {
+            HDC memDc = CreateCompatibleDC(hdc);
+            HBITMAP memBmp = CreateCompatibleBitmap(hdc, w, h);
+            HBITMAP oldBmp = (HBITMAP)SelectObject(memDc, memBmp);
+            DrawVariantPopupContent(memDc, rc, g_variantPopupCellW, g_variantPopupCellH, g_variantPopupPad);
+            BitBlt(hdc, 0, 0, w, h, memDc, 0, 0, SRCCOPY);
+            SelectObject(memDc, oldBmp);
+            DeleteObject(memBmp);
+            DeleteDC(memDc);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        int cols = (std::max)(1, ((int)rc.right - g_variantPopupPad) / g_variantPopupCellW);
+        int col = (pt.x - g_variantPopupPad) / g_variantPopupCellW;
+        int row = (pt.y - g_variantPopupPad) / g_variantPopupCellH;
+        if (col >= 0 && row >= 0 && col < cols) {
+            int idx = row * cols + col;
+            if (idx >= 0 && idx < (int)g_variantPopupAssets.size()) {
+                Asset* a = g_variantPopupAssets[(size_t)idx];
+                std::wstring path = a ? a->path : L"";
+                DestroyWindow(hwnd);
+                if (!path.empty()) {
+                    SetVariantPrimary(path);
+                    RefreshAssets(false);
+                }
+                return 0;
+            }
+        }
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    case WM_RBUTTONDOWN:
+    case WM_KILLFOCUS:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        KillTimer(hwnd, ID_TIMER_VARIANT_POPUP);
+        g_variantPopupLastTick = 0;
+        if (!g_variantPopupAssets.empty() && g_variantPopupAssets[0]) {
+            auto* meta = GetAssetMetaForPath(g_variantPopupAssets[0]->path);
+            if (meta && !meta->variantGroup.empty()) {
+                for (auto* a : GetVariantMembers(meta->variantGroup)) {
+                    auto* m = GetAssetMetaForPath(a->path);
+                    if (m && m->variantPrimary) {
+                        ResetAssetPreviewPlayback(a);
+                        break;
+                    }
+                }
+            }
+        }
+        if (g_hVariantPopup == hwnd) g_hVariantPopup = nullptr;
+        g_variantPopupAssets.clear();
+        if (g_hwnd && IsWindow(g_hwnd)) {
+            g_previewAllLastTick = 0;
+            g_previewHoverLastTick = 0;
+            SetTimer(g_hwnd, ID_TIMER_HOVER, GetPreviewAllTickMs(), NULL);
+            InvalidateRect(g_hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+static void ShowVariantPopupForAsset(HWND hwnd, Asset* asset) {
+    if (!hwnd || !asset) return;
+    auto* meta = GetAssetMetaForPath(asset->path);
+    if (!meta || meta->variantGroup.empty()) return;
+    std::vector<Asset*> members = GetVariantMembers(meta->variantGroup);
+    if (members.size() <= 1) return;
+
+    if (g_hVariantPopup && IsWindow(g_hVariantPopup)) {
+        DestroyWindow(g_hVariantPopup);
+    }
+    if (g_hwnd && IsWindow(g_hwnd)) {
+        KillTimer(g_hwnd, ID_TIMER_HOVER);
+        g_previewAllLastTick = 0;
+        g_previewHoverLastTick = 0;
+    }
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = VariantPopupProc;
+    wc.hInstance = g_hInst;
+    wc.lpszClassName = L"MyAsset_VariantPopup";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
+    RegisterClassW(&wc);
+
+    for (auto* a : members) ResetAssetPreviewPlayback(a);
+    g_variantPopupAssets = members;
+    int count = (int)members.size();
+    POINT pt;
+    GetCursorPos(&pt);
+    RECT bounds = {};
+    if (!GetWindowRect(hwnd, &bounds)) {
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
+        bounds = mi.rcWork;
+    }
+    int maxW = (std::max)(80, (int)(bounds.right - bounds.left));
+    int maxH = (std::max)(60, (int)(bounds.bottom - bounds.top));
+    int baseCellW = 96;
+    int baseCellH = 64;
+    int pad = 8;
+    int maxColsByWidth = (std::max)(1, (maxW - pad * 2) / baseCellW);
+    int cols = (std::min)((std::min)(4, (std::max)(1, count)), maxColsByWidth);
+    int rows = (count + cols - 1) / cols;
+    int w = pad * 2 + cols * baseCellW;
+    int h = pad * 2 + rows * baseCellH;
+    if (w > maxW || h > maxH) {
+        double scaleW = (double)(std::max)(1, maxW - pad * 2) / (double)(std::max)(1, cols * baseCellW);
+        double scaleH = (double)(std::max)(1, maxH - pad * 2) / (double)(std::max)(1, rows * baseCellH);
+        double scale = (std::min)(scaleW, scaleH);
+        if (scale > 1.0) scale = 1.0;
+        g_variantPopupCellW = (std::max)(48, (int)(baseCellW * scale));
+        g_variantPopupCellH = (std::max)(32, (int)(baseCellH * scale));
+    } else {
+        g_variantPopupCellW = baseCellW;
+        g_variantPopupCellH = baseCellH;
+    }
+    g_variantPopupPad = pad;
+    maxColsByWidth = (std::max)(1, (maxW - pad * 2) / g_variantPopupCellW);
+    cols = (std::min)((std::min)(4, (std::max)(1, count)), maxColsByWidth);
+    rows = (count + cols - 1) / cols;
+    w = (std::min)(maxW, pad * 2 + cols * g_variantPopupCellW);
+    h = (std::min)(maxH, pad * 2 + rows * g_variantPopupCellH);
+    int x = pt.x;
+    int y = pt.y;
+    if (x + w > bounds.right) x = bounds.right - w;
+    if (y + h > bounds.bottom) y = bounds.bottom - h;
+    if (x < bounds.left) x = bounds.left;
+    if (y < bounds.top) y = bounds.top;
+    g_hVariantPopup = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+        L"MyAsset_VariantPopup",
+        L"",
+        WS_POPUP,
+        x, y, w, h,
+        hwnd, nullptr, g_hInst, nullptr);
+    if (g_hVariantPopup) {
+        g_variantPopupLastTick = GetTickCount64();
+        SetTimer(g_hVariantPopup, ID_TIMER_VARIANT_POPUP, GetPreviewAllTickMs(), NULL);
+        SetLayeredWindowAttributes(g_hVariantPopup, 0, 0, LWA_ALPHA);
+        ShowWindow(g_hVariantPopup, SW_SHOW);
+        RedrawWindow(g_hVariantPopup, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+        SetLayeredWindowAttributes(g_hVariantPopup, 0, 255, LWA_ALPHA);
+        SetForegroundWindow(g_hVariantPopup);
+    }
 }
 
 // ============================================================
@@ -5287,8 +6122,9 @@ static void DrawContent(HDC hdc, int w, int h) {
                 srcY = (ih - srcH) / 2.0f;
             }
 
-            int imgX = g_previewThumbOnly ? (x + (cw - thumbW) / 2) : (x + 7);
-            int imgY = y + (itemH - thumbH) / 2;
+            RECT rcThumb = GetAssetThumbRectForItem(x, y, cw, itemH);
+            int imgX = rcThumb.left;
+            int imgY = rcThumb.top;
             g.DrawImage(p->pImage, 
                 Rect(imgX, imgY, thumbW, thumbH),
                 (INT)srcX, (INT)srcY, (INT)srcW, (INT)srcH,
@@ -5296,6 +6132,18 @@ static void DrawContent(HDC hdc, int w, int h) {
         }
 
         if (!g_previewThumbOnly && p->isFavorite) { SetTextColor(hdc, RGB(255, 215, 0)); SelectObject(hdc, g_hFontUI); RECT rs = {ri.right - 25, ri.top + 5, ri.right - 5, ri.top + 25}; DrawTextW(hdc, L"★", -1, &rs, DT_RIGHT); }
+
+        if (AssetHasVariants(*p)) {
+            RECT rcThumb = GetAssetThumbRectForItem(x, y, cw, itemH);
+            RECT rv = GetVariantButtonRect(rcThumb);
+            HBRUSH brVar = CreateSolidBrush(COL_BTN_ACT);
+            FillRect(hdc, &rv, brVar);
+            DeleteObject(brVar);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, COL_TEXT);
+            SelectObject(hdc, g_hFontUI);
+            DrawTextW(hdc, L"▼", -1, &rv, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
         
         if (!g_previewThumbOnly) {
             g.SetSmoothingMode(SmoothingModeAntiAlias);
@@ -5311,8 +6159,15 @@ static void DrawContent(HDC hdc, int w, int h) {
             }
             g.SetSmoothingMode(SmoothingModeDefault);
 
-            SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontList); RECT rn = {x + thumbW + 15, y + 15, ri.right - 30, y + 45}; DrawTextW(hdc, p->name.c_str(), -1, &rn, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            SetTextColor(hdc, COL_SUBTEXT); SelectObject(hdc, g_hFontListSub); RECT rc = {x + thumbW + 15, y + 50, ri.right - 10, ri.bottom - 5}; DrawTextW(hdc, p->category.c_str(), -1, &rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+            std::wstring displayName = p->name;
+            if (auto* meta = GetAssetMetaForPath(p->path)) {
+                if (!meta->variantGroup.empty()) {
+                    displayName = GetVariantGroupDisplayName(meta->variantGroup);
+                }
+            }
+            SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontList); RECT rn = {x + thumbW + 15, y + 15, ri.right - 30, y + 45}; DrawTextW(hdc, displayName.c_str(), -1, &rn, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            std::wstring categoryName = GetCategoryDisplayName(p->category);
+            SetTextColor(hdc, COL_SUBTEXT); SelectObject(hdc, g_hFontListSub); RECT rc = {x + thumbW + 15, y + 50, ri.right - 10, ri.bottom - 5}; DrawTextW(hdc, categoryName.c_str(), -1, &rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
 
         
@@ -5439,6 +6294,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         
         CheckAndOptimizeLegacyAssets(hwnd);
         
+        SetTimer(hwnd, ID_TIMER_REORDER_HINT_POLL, 100, NULL);
         RefreshAssets(true); return 0;
     }
 
@@ -5476,8 +6332,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+
+        if (wp == ID_TIMER_REORDER_HINT_POLL) {
+            bool visible = CanStartCustomReorder() && ((GetKeyState(VK_CONTROL) & 0x8000) != 0);
+            if (visible != g_reorderCtrlHintVisible) {
+                g_reorderCtrlHintVisible = visible;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
         
         if (wp == ID_TIMER_HOVER) {
+            if (g_hVariantPopup && IsWindow(g_hVariantPopup)) {
+                KillTimer(hwnd, ID_TIMER_HOVER);
+                g_previewAllLastTick = 0;
+                g_previewHoverLastTick = 0;
+                return 0;
+            }
             bool pausePreviewForReorder = CanStartCustomReorder() && (((GetKeyState(VK_CONTROL) & 0x8000) != 0) || g_isReorderDrag);
             if (pausePreviewForReorder) {
                 KillTimer(hwnd, ID_TIMER_HOVER);
@@ -5841,6 +6712,28 @@ RBUTTON_HANDLER:
                     AppendMenuW(hm, MF_STRING, IDM_TEXT_STYLE_COMMIT, L"テキストスタイルを確定");
                     AppendMenuW(hm, MF_STRING, IDM_TEXT_STYLE_CANCEL, L"テキストスタイルを取消");
                 }
+                AppendMenuW(hm, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(hm, MF_STRING, IDM_VARIANT_CREATE, L"バリエーショングループを作成");
+                HMENU hVarAdd = CreatePopupMenu();
+                g_variantAddCommandGroups.clear();
+                std::set<std::wstring> seenGroups;
+                int varCmd = IDM_VARIANT_ADD_BASE;
+                for (const auto& a2 : g_assets) {
+                    auto* meta = GetAssetMetaForPath(a2.path);
+                    if (!meta || meta->variantGroup.empty()) continue;
+                    if (!seenGroups.insert(meta->variantGroup).second) continue;
+                    if (!IsVariantGroupCategoryCompatible(meta->variantGroup, p->category)) continue;
+                    std::wstring label = GetVariantGroupDisplayName(meta->variantGroup);
+                    AppendMenuW(hVarAdd, MF_STRING, varCmd, label.c_str());
+                    g_variantAddCommandGroups[varCmd] = meta->variantGroup;
+                    varCmd++;
+                    if (varCmd >= IDM_VARIANT_PICK_BASE) break;
+                }
+                AppendMenuW(hm, MF_POPUP | (g_variantAddCommandGroups.empty() ? MF_GRAYED : 0), (UINT_PTR)hVarAdd, L"既存グループに追加");
+                auto* vm = GetAssetMetaForPath(p->path);
+                UINT groupedFlags = (vm && !vm->variantGroup.empty()) ? MF_STRING : MF_GRAYED;
+                AppendMenuW(hm, groupedFlags, IDM_VARIANT_RENAME, L"バリエーショングループ名を変更");
+                AppendMenuW(hm, groupedFlags, IDM_VARIANT_REMOVE, L"バリエーションから外す");
                 AppendMenuW(hm, MF_STRING, IDM_DELETE, L"削除"); 
             }
             else {
@@ -5879,6 +6772,60 @@ RBUTTON_HANDLER:
         else if (id == IDM_TEXT_STYLE_CANCEL) {
             CancelPendingTextStyle(hwnd);
         }
+        else if (id == IDM_VARIANT_CREATE && g_contextTargetIndex != -1) {
+            Asset* p = g_displayAssets[g_contextTargetIndex];
+            std::wstring groupName = p->name;
+            if (!ShowDarkInput(hwnd, L"バリエーショングループ作成", L"グループ名を入力してください。", groupName, groupName)) return 0;
+            groupName = TrimWide(groupName);
+            if (groupName.empty()) return 0;
+            std::set<std::wstring> ignorePaths = { p->path };
+            if (IsVariantGroupNameDuplicatedInCategory(p->category, groupName, L"", ignorePaths)) {
+                ShowDarkMsg(hwnd, L"同じカテゴリ内に同名のアセットまたはバリエーショングループがあります。", L"Info", MB_OK);
+                return 0;
+            }
+            CreateVariantGroupForAsset(p->path, groupName);
+            RefreshAssets(false);
+        }
+        else if (id == IDM_VARIANT_REMOVE && g_contextTargetIndex != -1) {
+            Asset* p = g_displayAssets[g_contextTargetIndex];
+            RemoveAssetFromVariantGroup(p->path);
+            RefreshAssets(false);
+        }
+        else if (id == IDM_VARIANT_RENAME && g_contextTargetIndex != -1) {
+            Asset* p = g_displayAssets[g_contextTargetIndex];
+            auto* meta = GetAssetMetaForPath(p->path);
+            if (!meta || meta->variantGroup.empty()) return 0;
+            std::wstring name = GetVariantGroupDisplayName(meta->variantGroup);
+            if (!ShowDarkInput(hwnd, L"バリエーショングループ名変更", L"新しいグループ名を入力してください。", name, name)) return 0;
+            name = TrimWide(name);
+            if (name.empty()) return 0;
+            std::set<std::wstring> ignorePaths;
+            if (IsVariantGroupNameDuplicatedInCategory(p->category, name, meta->variantGroup, ignorePaths)) {
+                ShowDarkMsg(hwnd, L"同じカテゴリ内に同名のアセットまたはバリエーショングループがあります。", L"Info", MB_OK);
+                return 0;
+            }
+            RenameVariantGroup(meta->variantGroup, name);
+            RefreshAssets(false);
+        }
+        else if (id >= IDM_VARIANT_ADD_BASE && id < IDM_VARIANT_PICK_BASE) {
+            auto it = g_variantAddCommandGroups.find(id);
+            if (it != g_variantAddCommandGroups.end() && g_contextTargetIndex != -1) {
+                Asset* p = g_displayAssets[g_contextTargetIndex];
+                if (!IsVariantGroupCategoryCompatible(it->second, p->category)) {
+                    ShowDarkMsg(hwnd, L"カテゴリが違うアセットは同じバリエーショングループに追加できません。", L"Info", MB_OK);
+                    return 0;
+                }
+                AddAssetToVariantGroup(p->path, it->second);
+                RefreshAssets(false);
+            }
+        }
+        else if (id >= IDM_VARIANT_PICK_BASE && id < IDM_VARIANT_PICK_BASE + 500) {
+            auto it = g_variantPickCommandPaths.find(id);
+            if (it != g_variantPickCommandPaths.end()) {
+                SetVariantPrimary(it->second);
+                RefreshAssets(false);
+            }
+        }
         else if (id == IDM_TOGGLE_FIXED && g_contextTargetIndex != -1) { 
             // Multiでない場合のみトグル可能
             if (!g_displayAssets[g_contextTargetIndex]->isMulti) {
@@ -5892,6 +6839,7 @@ RBUTTON_HANDLER:
                 if (p->pImage) { delete p->pImage; p->pImage = nullptr; } 
                 DeleteFileW(p->path.c_str()); 
                 g_textStylePaths.erase(p->path);
+                g_assetMetaMap.erase(p->path);
                 SaveTextStyleFlags();
                 std::wstring base = p->path.substr(0, p->path.find_last_of(L"."));
                 DeleteFileW((base + L".png").c_str()); DeleteFileW((base + L".gif").c_str());
@@ -5951,10 +6899,25 @@ RBUTTON_HANDLER:
         }
         if (y > listTop && y < rc.bottom - GetBottomReservedHeight()) {
             int cols = (std::max)(1, (int)rc.right / GetListItemMinWidth()); int cw = (int)rc.right / cols;
-            int idx = ((y - listTop + g_scrollY) / GetListItemHeight()) * cols + (x / cw);
+            int itemH = GetListItemHeight();
+            int row = (y - listTop + g_scrollY) / itemH;
+            int col = x / cw;
+            int idx = row * cols + col;
             if (idx >= 0 && idx < (int)g_displayAssets.size()) {
+                Asset* clickedAsset = g_displayAssets[idx];
+                if (clickedAsset && AssetHasVariants(*clickedAsset)) {
+                    int itemX = col * cw;
+                    int itemY = row * itemH + (listTop - g_scrollY);
+                    RECT rcThumb = GetAssetThumbRectForItem(itemX, itemY, cw, itemH);
+                    RECT rv = GetVariantButtonRect(rcThumb);
+                    POINT pt = { x, y };
+                    if (PtInRect(&rv, pt)) {
+                        ShowVariantPopupForAsset(hwnd, clickedAsset);
+                        return 0;
+                    }
+                }
                 if (g_enableTextStyle && g_assetViewTab == 1) {
-                    Asset* p = g_displayAssets[idx];
+                    Asset* p = clickedAsset;
                     if (!p->isTextStyle) return 0;
                     if (g_textStylePending) {
                         CancelPendingTextStyle(hwnd);
@@ -6028,8 +6991,9 @@ RBUTTON_HANDLER:
     case WM_MOUSEMOVE: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp); RECT rc; GetClientRect(hwnd, &rc);
         if (!g_isMouseTracking) { TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 }; TrackMouseEvent(&tme); g_isMouseTracking = true; }
+        bool variantPopupOpen = (g_hVariantPopup && IsWindow(g_hVariantPopup));
         bool pausePreviewForReorder = CanStartCustomReorder() && (((GetKeyState(VK_CONTROL) & 0x8000) != 0) || g_isReorderDrag);
-        if (pausePreviewForReorder) {
+        if (pausePreviewForReorder || variantPopupOpen) {
             KillTimer(hwnd, ID_TIMER_HOVER);
             g_previewAllLastTick = 0;
             g_previewHoverLastTick = 0;
@@ -6048,7 +7012,7 @@ RBUTTON_HANDLER:
         int listTop = GetListTopY();
         bool mouseInList = (y > listTop && y < rc.bottom - GetBottomReservedHeight() && x >= 0 && x < rc.right);
         if (mouseInList) {
-            if (!pausePreviewForReorder && g_previewPlaybackMode == 1) {
+            if (!variantPopupOpen && !pausePreviewForReorder && g_previewPlaybackMode == 1) {
                 if (g_previewAllLastTick == 0) g_previewAllLastTick = GetTickCount64();
                 SetTimer(hwnd, ID_TIMER_HOVER, GetPreviewAllTickMs(), NULL);
             }
@@ -6060,7 +7024,7 @@ RBUTTON_HANDLER:
             if (idx >= 0 && idx < (int)g_displayAssets.size()) { 
                 if (g_hoverIndex != idx) {
                     g_hoverIndex = idx;
-                    if (!pausePreviewForReorder && g_previewPlaybackMode == 0) {
+                    if (!variantPopupOpen && !pausePreviewForReorder && g_previewPlaybackMode == 0) {
                         g_previewHoverLastTick = 0;
                         SetTimer(hwnd, ID_TIMER_HOVER, GetPreviewAllTickMs(), NULL);
                     }
@@ -6181,6 +7145,7 @@ RBUTTON_HANDLER:
     }
     case WM_DESTROY: 
         SaveWindowPos(hwnd, false); 
+        KillTimer(hwnd, ID_TIMER_REORDER_HINT_POLL);
         g_pendingLayerApiCompare = false;
         g_pendingLayerApiCompareObjs.clear();
         g_pendingAddObjSnapshots.clear();
@@ -6196,6 +7161,7 @@ RBUTTON_HANDLER:
         if(g_hSnipWnd) DestroyWindow(g_hSnipWnd);
         if(g_hInfoWnd) DestroyWindow(g_hInfoWnd);
         if(g_hTooltip) DestroyWindow(g_hTooltip); 
+        if(g_hVariantPopup) DestroyWindow(g_hVariantPopup);
         if (g_hBrInputBg) { DeleteObject(g_hBrInputBg); g_hBrInputBg = nullptr; }
         if (g_hBrBg) { DeleteObject(g_hBrBg); g_hBrBg = nullptr; }
         GdiplusShutdown(g_gdiplusToken); 
